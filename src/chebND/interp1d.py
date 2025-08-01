@@ -1,0 +1,67 @@
+import numpy as np
+from scipy.fft import dct
+from chebND.clenshaw import clenshaw_1d
+from chebND.utils import chebyshev_nodes
+def compute_chebyshev_coefficients_1d(func_or_vals, a, b, N, kind='dct'):
+    """
+    Compute the Chebyshev coefficients of a function or discrete values on [-1, 1] scaled to [a, b].
+    
+    Parameters:
+        func_or_vals: Callable or np.ndarray
+            Either a function f(x), or an array of y-values defined at Chebyshev points.
+        a, b: float
+            Domain bounds [a, b] over which interpolation is defined.
+        N: int
+            Number of Chebyshev points.
+        kind: str
+            'dct' (default) uses SciPy DCT-I to compute coefficients.
+
+    Returns:
+        coeffs: np.ndarray
+            Chebyshev coefficients.
+    """
+
+    if callable(func_or_vals):
+        x= chebyshev_nodes(N,a,b)
+        y = func_or_vals(x)
+    else:
+        y = np.asarray(func_or_vals)
+
+    # Compute Chebyshev coefficients using DCT-I (type 1)
+    coeffs = dct(y, type=2) / N 
+    coeffs[0] *= 0.5
+
+    return coeffs
+
+
+class ChebyshevInterpolant1D:
+    def __init__(self, func_or_vals, a, b, N):
+        """
+        Construct a 1D Chebyshev interpolant.
+
+        Parameters:
+            func_or_vals: Callable or array
+                Function f(x) or array of values at Chebyshev nodes.
+            a, b: float
+                Domain bounds [a, b].
+            N: int
+                Number of Chebyshev points.
+        """
+        self.a = a
+        self.b = b
+        self.N = N
+
+        if callable(func_or_vals):
+            self.x_nodes = chebyshev_nodes(N, a, b)
+            y = func_or_vals(self.x_nodes)
+        else:
+            y = np.asarray(func_or_vals)
+
+        # To make this work with end points, use type=1, divide by N-1 and 0.5*coeff[-1]
+        self.coeffs = dct(y, type=2) / N
+        self.coeffs[0] *= 0.5
+
+    def evaluate(self, x):
+        """Evaluate the interpolant at x (scalar or array)."""
+        x = np.atleast_1d(x)
+        return np.array([clenshaw_1d(self.coeffs, xi, self.a, self.b) for xi in x])

@@ -1,0 +1,15 @@
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "chebND"
+version = "0.1.0"
+description = "Multidimensional Chebyshev interpolation"
+authors = [{ name = "Your Name", email = "you@example.com" }]
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.8"
+
+[tool.setuptools.packages.find]
+where = ["src"]
