@@ -61,7 +61,63 @@ class ChebyshevInterpolant1D:
         self.coeffs = dct(y, type=2) / N
         self.coeffs[0] *= 0.5
 
+        self.absErr = max(abs(self.coeffs[-1]), abs(self.coeffs[-2]))
+        self.maxCoeff = max(abs(self.coeffs))
+        self.relErr = self.absErr/self.maxCoeff
+        self.k_max = len(self.coeffs) - 1
+
+    def get_coefficients(self):
+        """
+        Get the Chebyshev coefficients of the interpolant.
+        
+        Returns:
+            np.ndarray: Chebyshev coefficients.
+        """
+        return self.coeffs
+    def absolute_error(self):
+        """
+        Compute the absolute error of the interpolant at point x.
+        
+        Returns:
+            float: Absolute error at the Chebyshev nodes.
+        """ 
+
+
+        return self.absErr
+
+    def relative_error(self):
+        """
+        Compute the relative error of the interpolant at point x.
+        
+        Returns:
+            float: Relative error at the Chebyshev nodes.
+        """
+        return self.relErr
+        
+
     def evaluate(self, x):
         """Evaluate the interpolant at x (scalar or array)."""
         x = np.atleast_1d(x)
-        return np.array([clenshaw_1d(self.coeffs, xi, self.a, self.b) for xi in x])
+        return np.array([clenshaw_1d(self.coeffs,xi,self.k_max, self.a, self.b) for xi in x])
+    
+    def optimize(self, rel_tol=1e-6):
+        """
+        Optimize the Chebyshev coefficients by removing small ones.
+        
+        Parameters:
+            rel_tol: float
+                Relative tolerance for coefficient significance.
+        
+        Returns:
+            np.ndarray: Positions of significant coefficients.
+        """
+        if rel_tol < self.relErr:
+            raise ValueError("Relative tolerance must be greater than the relative error of the interpolant.")
+        
+        k_max = len(self.coeffs) - 1
+        for k in range(len(self.coeffs) - 1, -1, -1):
+            if abs(self.coeffs[k]) > rel_tol * self.maxCoeff:
+                k_max = k
+                break
+                
+        self.k_max = k_max
