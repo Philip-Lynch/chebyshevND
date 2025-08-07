@@ -1,33 +1,5 @@
 import numpy as np
 
-def sort_2d_by_first_column_desc(arr):
-    """
-    Sort a 2D numpy array by the first column in descending order.
-    """
-    return arr[arr[:, 0].argsort()[::-1]]
-
-def read_1d_data_from_file(filename):
-    """
-    Read a 2-column .dat file (x, y) into a 2D numpy array.
-    """
-    try:
-        data = np.loadtxt(filename)
-        if data.ndim == 1:
-            data = np.expand_dims(data, axis=0)
-        return data
-    except Exception as e:
-        print(f"Error reading file {filename}: {e}")
-        return np.array([])
-
-def find_significant_coeffs_1d(coeffs, tol=1e-12):
-    """
-    Find the index of the last significant Chebyshev coefficient.
-    """
-    for i in range(len(coeffs)-1, -1, -1):
-        if abs(coeffs[i]) > tol:
-            return i
-    return 0
-
 def chebyshev_gauss_lobatto_nodes(N,a,b):
     """
     Generate Chebyshev-Gauss-Lobatto nodes for N points.
@@ -63,7 +35,57 @@ def chebyshev_nodes(N,a,b):
             Chebyshev nodes in the interval [a, b].
     """
     # Chebyshev nodes on [-1, 1]
-    x_cheb = - np.cos(np.pi * (2*np.arange(N)+1) / (2*N))
+    x_cheb = np.cos(np.pi * (2*np.arange(N)+1) / (2*N))
     # Rescale to [a, b]
     x = 0.5 * (b - a) * x_cheb + 0.5 * (a + b)
     return x
+
+
+# Adaptive Clenshaw algorithm for 1D Chebyshev polynomial evaluation
+# Eliminating insignificant coefficients to speed up the evaluation
+
+
+def find_significant_coeffs_1d(coefficients, rel_tol=1e-8, max_coeff=None, x_max_minus_i=1.):
+
+    if max_coeff is None:
+        max_coeff = np.max(np.abs(coefficients))
+
+    nymax = 0
+    # Find the last significant coefficient
+    n = len(coefficients)
+    for i in range(n - 1, -1, -1):
+        if abs(coefficients[i]) > (rel_tol * max_coeff) /x_max_minus_i/(n):
+            nymax = i
+            break
+    else:
+        return 0  # If all coefficients are below tol, return 0
+
+    return nymax
+
+
+# Adaptive Clenshaw algorithm for 2D Chebyshev polynomial evaluation
+
+def find_significant_coeffs_2d(coefficients, rel_tol=1e-8,max_coeff=None, x_max_minus_i=1.):
+
+    nx, ny = coefficients.shape
+    tmp = np.zeros(nx)
+    nyMax = np.zeros(nx)
+
+    if coefficients.ndim != 2:
+        raise ValueError("Input coefficients must be a 2D array.")
+
+    if rel_tol <= 0:
+        raise ValueError("Relative tolerance must be positive.")
+    if max_coeff is None:
+        max_coeff = np.max(np.abs(coefficients))
+
+
+    # Evaluate in the y-direction first
+    for i in range(nx):
+        nyMax[i] = find_significant_coeffs_1d(coefficients[i, :], rel_tol / x_max_minus_i ,max_coeff=max_coeff, x_max_minus_i = nx)
+
+    # Trim off the trailing zeros
+    last_nz = np.max(np.nonzero(nyMax))
+    nyMaxTrimmed = nyMax[:last_nz + 1]
+
+    return nyMaxTrimmed.astype(np.int64)
