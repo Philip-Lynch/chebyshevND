@@ -1,6 +1,7 @@
 
 import numpy as np
 from numba import njit
+from chebND.utils import rescale_variable
 
 @njit
 def clenshaw_1d(coeffs, x,  k_max=None, a=-1.0, b=1.0):
@@ -69,3 +70,141 @@ def clenshaw_2d(coeffs, x, y, NyMaxes = None, ax = -1., bx=1, ay=-1., by=1):
     
     # Then evaluate resulting 1D Chebyshev series in x-direction
     return clenshaw_1d(temp, tx,NyMaxes.shape[0])
+
+''' 
+@njit
+def clenshaw_3d(coeffs, x, y, z, kmax=None,
+                ax=-1., bx=1., ay=-1., by=1., az=-1., bz=1.):
+    """
+    3D Clenshaw, reusing clenshaw_2d inside.
+    """
+    # Nx, Ny, Nz = coeffs.shape
+    if kmax is None:
+        kmax = coeffs.shape
+
+    # Map z
+    tz = (2 * z - (bz + az)) / (bz - az)
+    NzMaxes = np.ones((kmax[0], kmax[1]), dtype=np.int64) * kmax[2]
+    # Evaluate along z for each (i, j)
+    temp_xy = np.empty((kmax[0], kmax[1]))
+    for i in range(kmax[0]):
+        for j in range(kmax[1]):
+            temp_xy[i, j] = clenshaw_1d(coeffs[i, j, :], tz, NzMaxes[i, j])
+
+    # Now evaluate the 2D interpolant in (x, y)
+    return clenshaw_2d(temp_xy, x, y, ax=ax, bx=bx, ay=ay, by=by)
+
+''' 
+@njit
+def clenshaw_3d(coeffs, x, y, z, 
+                ax = -1., bx = 1., 
+                ay = -1., by = 1., 
+                az = -1., bz = 1.,
+                kmax=None):
+    """
+    coeffs: (nx,ny,nz) full coefficients (you may pass a trimmed block)
+    kmax: (ix,iy,iz) optional; if None uses coeffs.shape
+    """
+    nx, ny, nz = coeffs.shape
+    if kmax is None:
+        ix, iy, iz = nx, ny, nz
+    else:
+        ix, iy, iz = kmax
+
+    # Scale x,y,z to [-1,1]
+    tx = rescale_variable(x, ax, bx)
+    ty = rescale_variable(y, ay, by)
+    tz = rescale_variable(z, az, bz)
+
+    # Evaluate along z first using only [:,:iz]
+    tmp_yx = np.empty((ix, iy))
+    for i in range(ix):
+        for j in range(iy):
+            tmp_yx[i, j] = clenshaw_1d(coeffs[i, j, :iz], tz)
+
+    # Then along y using only [:iy]
+    tmp_x = np.empty(ix)
+    for i in range(ix):
+        tmp_x[i] = clenshaw_1d(tmp_yx[i, :iy], ty)
+
+    # Finally along x using only [:ix]
+    return clenshaw_1d(tmp_x[:ix], tx)
+
+@njit
+def clenshaw_4d(coeffs, x, y, z, w,
+                ax=-1., bx=1., ay=-1., by=1.,
+                az=-1., bz=1., aw=-1., bw=1.,
+                kmax=None):
+    """
+    4D Clenshaw, reusing clenshaw_3d inside.
+    """
+    Nx, Ny, Nz, Nw = coeffs.shape
+
+    if kmax is None:
+        ix, iy, iz,iw = Nx, Ny, Nz, Nw
+    else:
+        ix, iy, iz, iw = kmax
+    # Map w
+    tw = (2 * w - (aw + bw)) / (bw - aw)
+
+    # Evaluate along w for each (i, j, k)
+    temp_xyz = np.empty((ix, iy, iz))
+    for i in range(ix):
+        for j in range(iy):
+            for k in range(iz):
+                temp_xyz[i, j, k] = clenshaw_1d(coeffs[i, j, k, :iw], tw)
+
+    # Now evaluate the 3D interpolant in (x, y, z)
+    return clenshaw_3d(temp_xyz, x, y, z,
+                       ax=ax, bx=bx,
+                       ay=ay, by=by,
+                       az=az, bz=bz,
+                       kmax = (ix, iy, iz))
+
+
+@njit
+def partial_clenshaw_4d(coeffs, x_value, a=-1., b=1., kmax = None):
+        """
+        Collapse x dimension at fixed x_value.
+        Returns a 3D array of effective coefficients in (y, z, w).
+        """
+        tx = rescale_variable(x_value, a, b)
+
+        Nx, Ny, Nz, Nw = coeffs.shape
+
+        if kmax is None:
+            ix, iy, iz,iw = Nx, Ny, Nz, Nw
+        else:
+            ix, iy, iz, iw = kmax
+
+        temp_yzw = np.empty((iy, iz, iw))
+
+        for j in range(iy):
+            for k in range(iz):
+                for l in range(iw):
+                    coeffs_x = coeffs[:Nx, j, k, l]
+                    temp_yzw[j, k, l] = clenshaw_1d(coeffs_x, tx)
+
+        return temp_yzw
+
+def clenshaw_nd(xs, coeffs):
+    d = xs.shape[0]
+
+    # Base case
+    if d == 1:
+        return clenshaw_1d(coeffs, xs[0])
+
+    x_last = xs[-1]
+    shape = coeffs.shape[:-1]
+    tmp = np.empty(shape, dtype=np.float64)
+
+    # Loop explicitly, no np.ndindex (Numba safer with nested loops)
+    it = np.nditer(tmp, flags=['multi_index'], op_flags=['writeonly'])
+    while not it.finished:
+        idx = it.multi_index
+        # Force 1D view along the last axis
+        coeff_vec = coeffs[idx + (slice(None),)]
+        it[0] = clenshaw_1d(coeff_vec, x_last)
+        it.iternext()
+
+    return clenshaw_nd(xs[:-1], tmp)

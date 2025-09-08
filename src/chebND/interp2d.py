@@ -1,10 +1,10 @@
 import numpy as np
 from scipy.fft import dctn
 from chebND.clenshaw import clenshaw_1d, clenshaw_2d
-from chebND.utils import chebyshev_nodes, find_significant_coeffs_2d
+from chebND.utils import chebyshev_nodes, find_significant_coeffs_2d, compute_chebyshev_coefficients_nd
 
 class ChebyshevInterpolant2D:
-    def __init__(self, func_or_vals,Nx, Ny, ax = -1., bx = 1., ay = -1., by = 1.):
+    def __init__(self, vals, ax = -1., bx = 1., ay = -1., by = 1., nodes = 'Chebyshev'):
         """
         Initialize a 2D Chebyshev interpolant.
 
@@ -18,23 +18,23 @@ class ChebyshevInterpolant2D:
             Nx, Ny : int
                 Number of Chebyshev points in x and y.
         """
+        self.Nx, self.Ny = vals.shape
         self.ax, self.bx = ax, bx
         self.ay, self.by = ay, by
-        self.Nx = Nx
-        self.Ny = Ny
+
         
 
         # Calculate the coefficients and store them
-        self.coeffs = self.compute_coefficients(func_or_vals,Nx, Ny, ax, bx, ay, by)
+        self.coeffs = compute_chebyshev_coefficients_nd(vals,nodes = nodes)
 
         # Calculate absolute and relative errors
         
         self.abs_error = self.absolute_error()
         self.max = np.max([np.abs(self.coeffs)])
         self.rel_error = self.abs_error / self.max
-        self.NyMaxes = np.ones(Nx, dtype=np.int64) * Ny
+        self.NyMaxes = np.ones(self.Nx, dtype=np.int64) * self.Ny
 
-    def compute_coefficients(self,func_or_vals,Nx, Ny, ax, bx, ay, by, kind='dct'):
+    def compute_coefficients(self,func_or_vals,Nx, Ny, ax, bx, ay, by, nodes='Chebyshev'):
         """
         Compute the 2D Chebyshev coefficients of a function or discrete values
         over [ax, bx] × [ay, by].

@@ -1,4 +1,13 @@
 import numpy as np
+import scipy.fft
+from scipy.fft import dctn
+from numba import njit
+
+@njit
+def rescale_variable(x, a, b):
+    # Function to rescale variable from [a, b] to [-1, 1]
+    return 2 * (x - a) / (b - a) - 1
+
 
 def chebyshev_gauss_lobatto_nodes(N,a,b):
     """
@@ -15,7 +24,7 @@ def chebyshev_gauss_lobatto_nodes(N,a,b):
             Chebyshev-Gauss-Lobatto nodes in the interval [a, b].
     """
     # Chebyshev-Gauss-Lobatto nodes on [-1, 1]
-    x_cheb = -np.cos(np.pi * np.arange(N) / (N - 1))
+    x_cheb =  np.cos(np.pi * np.arange(N) / (N - 1))
     # Rescale to [a, b]
     x = 0.5 * (b - a) * x_cheb + 0.5 * (a + b)
     return x
@@ -40,10 +49,201 @@ def chebyshev_nodes(N,a,b):
     x = 0.5 * (b - a) * x_cheb + 0.5 * (a + b)
     return x
 
+def renormalize_coefficients_GL(coeffs,copy=True):
+    """
+    Renormalise DCT-I (norm=None) output on an extrema (Gauss-Lobatto) tensor grid
+    to standard Chebyshev-series convention, for arbitrary dimension.
 
+    This generalises:
+      2D: divide by (Nx-1)(Ny-1), then halve rows/cols at indices 0 and -1
+      3D: divide by (Nx-1)(Ny-1)(Nz-1), then halve each of the 6 faces, etc.
+
+    Parameters
+    ----------
+    coeffs : ndarray, shape (N1, N2, ..., Nd)
+        Output of scipy.fft.dctn(..., type=1, norm=None).
+    copy : bool
+        If True, work on a copy and return it. If False, scale in-place.
+
+    Returns
+    -------
+    ndarray
+        Renormalised Chebyshev coefficients (same shape as input).
+    """
+    arr = coeffs.copy() if copy else coeffs
+    shape = arr.shape
+
+    if any(N < 2 for N in shape):
+        raise ValueError("All dimensions must have size >= 2 for DCT-I normalization.")
+
+    # 1) divide by prod(Nr - 1)
+    scale = 1.0
+    for N in shape:
+        scale *= (N - 1)
+    arr /= scale
+
+    # 2) halve endpoint hyperplanes along each axis
+    ndim = arr.ndim
+    for axis, N in enumerate(shape):
+        # first index plane
+        sl = [slice(None)] * ndim
+        sl[axis] = 0
+        arr[tuple(sl)] *= 0.5
+        # last index plane
+        sl[axis] = N - 1
+        arr[tuple(sl)] *= 0.5
+
+    return arr
+
+# Code for renormalizing nD Chebyshev coefficients computed via DCT
+def renormalize_coefficients_Chebyshev(out: np.ndarray) -> np.ndarray:
+    """
+    Renormalize an nD array of Chebyshev coefficients.
+
+    Parameters
+    ----------
+    out : np.ndarray
+        n-dimensional array of Chebyshev coefficients.
+
+    Returns
+    -------
+    normalized : np.ndarray
+        Renormalized coefficients with the same shape as `out`.
+    """
+    shape = out.shape
+    ndim = out.ndim
+
+    # Create factor arrays for each axis
+    factors = []
+    for n in shape:
+        f = np.ones(n)
+        f[0] = 2
+        factors.append(f)
+
+    # Build the scale tensor via outer products (einsum over all dims)
+    einsum_subscripts = ",".join(chr(ord("a") + i) for i in range(ndim)) + "->" + "".join(chr(ord("a") + i) for i in range(ndim))
+    scale = np.einsum(einsum_subscripts, *factors)
+
+    # Normalize by scale * product of sizes
+    normalized = out / (scale * np.prod(shape))
+
+    return normalized
+    
+
+# Code for computing nD Chebyshev coefficients using DCT
+def compute_chebyshev_coefficients_nd(f_values: np.ndarray,nodes = 'Chebyshev') -> np.ndarray:
+    """
+    Compute Chebyshev coefficients for an nD array of function values using DCT.
+
+    Parameters
+    ----------
+    f_values : np.ndarray
+        n-dimensional array of function values on a Chebyshev tensor grid.
+
+    Returns
+    -------
+    coeffs : np.ndarray
+        n-dimensional array of Chebyshev coefficients.
+    """
+    if(nodes == 'Chebyshev'):
+        coeffs = dctn(f_values, type=2, norm=None)
+        coeffs = renormalize_coefficients_Chebyshev(coeffs)
+    elif(nodes == 'GaussLobatto'):
+        coeffs = dctn(f_values, type=1, norm=None)
+        coeffs = renormalize_coefficients_GL(coeffs)
+    else:
+        ValueError('Incorrect node type. Please choose either Chebyshev or GaussLobatto')
+    return coeffs
 # Adaptive Clenshaw algorithm for 1D Chebyshev polynomial evaluation
 # Eliminating insignificant coefficients to speed up the evaluation
 
+def prune_trailing_slices_greedy_nd(coeffs, delta=1e-10, scale='max'):
+    """
+    Structured pruning of nD Chebyshev coeffs by removing trailing slices
+    along axes to reduce Clenshaw lengths while controlling a global relative error.
+
+    Error control: sum(|discarded coeffs|) <= delta * S, with S given by `scale`.
+
+    Parameters
+    ----------
+    coeffs : ndarray
+        Chebyshev coefficients, n-dimensional.
+    delta : float
+        Allowed global relative error.
+    scale : {'max','l1','l2', float}
+        Scale S for the relative tolerance:
+          - 'max' (default): S = max(abs(coeffs))
+          - 'l1' : S = sum(abs(coeffs))
+          - 'l2' : S = norm(coeffs.ravel(), 2)
+          - float: use the provided value
+
+    Returns
+    -------
+    kmax : tuple
+        Truncation limits along each axis; keep coeffs[ :kmax[0], :kmax[1], ..., :kmax[n-1] ].
+    discarded_abs_sum : float
+        Sum of |coeffs| discarded (an upper bound on absolute uniform error).
+    """
+    c = np.asarray(coeffs)
+    shape = c.shape
+    ndim = c.ndim
+    if c.size == 0:
+        return (0,) * ndim, 0.0
+
+    abs_c = np.abs(c)
+    if scale == 'max':
+        S = abs_c.max()
+    elif scale == 'l1':
+        S = abs_c.sum()
+    elif scale == 'l2':
+        S = np.sqrt(np.sum(abs_c**2))
+    elif isinstance(scale, (int, float)):
+        S = float(scale)
+    else:
+        raise ValueError("scale must be 'max', 'l1', 'l2', or a float")
+
+    if S == 0.0:
+        # all-zero; keep nothing
+        return (0,) * ndim, 0.0
+
+    tau = delta * S
+
+    # Precompute L1 costs of each trailing slice along each axis
+    # cost[axis][i] = L1 norm of slice at index i along that axis
+    costs = []
+    for ax in range(ndim):
+        summed = abs_c.sum(axis=tuple(j for j in range(ndim) if j != ax))
+        costs.append(summed)
+
+    # Start from full sizes
+    kmax = list(shape)
+    discarded = 0.0
+
+    while True:
+        # compute cost of trimming one more slice on each axis
+        next_costs = []
+        for ax in range(ndim):
+            idx = kmax[ax] - 1
+            if idx >= 0:
+                next_costs.append(costs[ax][idx])
+            else:
+                next_costs.append(np.inf)
+
+        axis = int(np.argmin(next_costs))
+        inc = next_costs[axis]
+
+        if not np.isfinite(inc):
+            break
+        if discarded + inc > tau:
+            break
+
+        discarded += inc
+        kmax[axis] -= 1
+
+        if any(k == 0 for k in kmax):
+            break
+
+    return tuple(kmax), discarded
 
 def find_significant_coeffs_1d(coefficients, rel_tol=1e-8, max_coeff=None, x_max_minus_i=1.):
 

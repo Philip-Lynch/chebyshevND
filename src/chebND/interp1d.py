@@ -35,7 +35,7 @@ def compute_chebyshev_coefficients_1d(func_or_vals, a, b, N, kind='dct'):
 
 
 class ChebyshevInterpolant1D:
-    def __init__(self, func_or_vals, a, b, N):
+    def __init__(self, func_or_vals, a, b, N, nodes = 'Chebyshev'):
         """
         Construct a 1D Chebyshev interpolant.
 
@@ -58,8 +58,16 @@ class ChebyshevInterpolant1D:
             y = np.asarray(func_or_vals)
 
         # To make this work with end points, use type=1, divide by N-1 and 0.5*coeff[-1]
-        self.coeffs = dct(y, type=2) / N
-        self.coeffs[0] *= 0.5
+        if nodes == 'Chebyshev':
+        
+            self.coeffs = dct(y, type=2) / N
+            self.coeffs[0] *= 0.5
+        elif nodes == 'GaussLobatto':
+            self.coeffs = dct(y, type=1, norm = None) /(N-1)
+            self.coeffs[0] *= 0.5
+            self.coeffs[-1] *= 0.5
+        else:
+            ValueError('Incorrect node type. Please choose either Chebyshev or GaussLobatto')
 
         self.absErr = max(abs(self.coeffs[-1]), abs(self.coeffs[-2]))
         self.maxCoeff = max(abs(self.coeffs))
