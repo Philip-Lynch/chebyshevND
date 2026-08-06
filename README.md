@@ -128,8 +128,32 @@ pytest
 
 ## Citation
 
-If this package contributes to your research, please cite it — citation
-metadata is in [CITATION.cff](CITATION.cff).
+The techniques implemented in this package were derived and developed for:
+
+> H. Khalvati, P. Lynch, O. Burke, L. Speri, M. van de Meent, and Z. Nasipak,
+> *Systematic errors in fast relativistic waveforms for Extreme Mass Ratio
+> Inspirals*, [Phys. Rev. D **113**, 084042 (2026)](https://doi.org/10.1103/4ly7-zn15),
+> [arXiv:2509.08875](https://arxiv.org/abs/2509.08875).
+
+If this package contributes to your research, please cite that paper — machine-readable
+citation metadata is in [CITATION.cff](CITATION.cff).
+
+```bibtex
+@article{Khalvati2026systematic,
+  author        = {Khalvati, Hassan and Lynch, Philip and Burke, Ollie and
+                   Speri, Lorenzo and van de Meent, Maarten and Nasipak, Zachary},
+  title         = {Systematic errors in fast relativistic waveforms for
+                   Extreme Mass Ratio Inspirals},
+  journal       = {Phys. Rev. D},
+  volume        = {113},
+  pages         = {084042},
+  year          = {2026},
+  doi           = {10.1103/4ly7-zn15},
+  eprint        = {2509.08875},
+  archivePrefix = {arXiv},
+  primaryClass  = {gr-qc}
+}
+```
 
 ## License
 

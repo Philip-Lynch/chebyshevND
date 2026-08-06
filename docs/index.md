@@ -58,3 +58,15 @@ examples/example_4d_interp
 
 api
 ```
+
+## Citation
+
+The techniques implemented in this package were derived and developed for:
+
+> H. Khalvati, P. Lynch, O. Burke, L. Speri, M. van de Meent, and Z. Nasipak,
+> *Systematic errors in fast relativistic waveforms for Extreme Mass Ratio
+> Inspirals*, [Phys. Rev. D **113**, 084042 (2026)](https://doi.org/10.1103/4ly7-zn15),
+> [arXiv:2509.08875](https://arxiv.org/abs/2509.08875).
+
+If this package contributes to your research, please cite that paper —
+machine-readable citation metadata is in the repository's `CITATION.cff`.

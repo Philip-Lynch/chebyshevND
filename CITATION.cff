@@ -1,5 +1,7 @@
 cff-version: 1.2.0
-message: "If you use this software, please cite it using the metadata below."
+message: >-
+  If you use this software, please cite the companion paper below, in which
+  the techniques implemented here were derived and developed.
 title: "ChebyshevND: fast multidimensional Chebyshev interpolation in Python"
 type: software
 authors:
@@ -10,3 +12,28 @@ authors:
 repository-code: "https://github.com/Philip-Lynch/chebyshevND"
 license: MIT
 version: 0.1.0
+preferred-citation:
+  type: article
+  title: "Systematic errors in fast relativistic waveforms for Extreme Mass Ratio Inspirals"
+  authors:
+    - family-names: Khalvati
+      given-names: Hassan
+    - family-names: Lynch
+      given-names: Philip
+    - family-names: Burke
+      given-names: Ollie
+    - family-names: Speri
+      given-names: Lorenzo
+    - family-names: van de Meent
+      given-names: Maarten
+    - family-names: Nasipak
+      given-names: Zachary
+  journal: "Physical Review D"
+  volume: 113
+  start: "084042"
+  year: 2026
+  doi: "10.1103/4ly7-zn15"
+  url: "https://arxiv.org/abs/2509.08875"
+  identifiers:
+    - type: other
+      value: "arXiv:2509.08875"
