@@ -101,9 +101,14 @@ def test_optimize_truncates_and_preserves_accuracy():
 
 
 def test_optimize_rejects_tolerance_below_resolution():
-    _, interp = build(np.exp, 0.0, 2.0, 40)
+    # Use a barely-resolved interpolant so its relative error is a genuine
+    # truncation level (~1e-2 for Runge at N=20), not platform-dependent
+    # rounding noise as with a fully-converged series.
+    f = lambda x: 1.0 / (1.0 + 25 * x**2)
+    _, interp = build(f, -1.0, 1.0, 20)
+    assert interp.relative_error() > 1e-6
     with pytest.raises(ValueError):
-        interp.optimize(rel_tol=1e-30)
+        interp.optimize(rel_tol=1e-6)
 
 
 def test_error_estimates_are_consistent():
