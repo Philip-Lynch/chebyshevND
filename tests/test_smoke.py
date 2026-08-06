@@ -7,7 +7,7 @@ the full unit-test suite is added separately.
 import numpy as np
 import pytest
 
-from chebND import (
+from chebyshevnd import (
     ChebyshevInterpolant1D,
     ChebyshevInterpolant2D,
     ChebyshevInterpolant3D,
@@ -15,7 +15,7 @@ from chebND import (
     clenshaw_1d,
     chebyshev_nodes,
 )
-from chebND.utils import chebyshev_gauss_lobatto_nodes
+from chebyshevnd.utils import chebyshev_gauss_lobatto_nodes
 
 
 def cheb_grid_values(f, domains, Ns):
@@ -26,10 +26,10 @@ def cheb_grid_values(f, domains, Ns):
 
 
 def test_import_surface():
-    import chebND
+    import chebyshevnd
 
-    for name in chebND.__all__:
-        assert hasattr(chebND, name), f"chebND.{name} listed in __all__ but missing"
+    for name in chebyshevnd.__all__:
+        assert hasattr(chebyshevnd, name), f"chebyshevnd.{name} listed in __all__ but missing"
 
 
 def test_clenshaw_1d_matches_numpy_chebval():

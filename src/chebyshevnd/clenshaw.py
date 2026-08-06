@@ -1,7 +1,7 @@
 
 import numpy as np
 from numba import njit
-from chebND.utils import rescale_variable
+from .utils import rescale_variable
 
 @njit
 def clenshaw_1d(coeffs, x,  k_max=None, a=-1.0, b=1.0):

@@ -1,7 +1,7 @@
 
 """
-chebND: Fast multidimensional Chebyshev interpolation in Python.
-Currently supports upto 4D interpolation. Higher dimensions coming soon!
+ChebyshevND: Fast multidimensional Chebyshev interpolation in Python.
+Currently supports up to 4D interpolation. Higher dimensions coming soon!
 """
 
 # Core interpolant class (1D)

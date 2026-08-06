@@ -1,7 +1,7 @@
 import numpy as np
 from scipy.fft import dctn
-from chebND.clenshaw import clenshaw_1d, clenshaw_2d,clenshaw_3d
-from chebND.utils import(compute_chebyshev_coefficients_nd,
+from .clenshaw import clenshaw_1d, clenshaw_2d,clenshaw_3d
+from .utils import(compute_chebyshev_coefficients_nd,
                          prune_trailing_slices_greedy_nd,
                          rescale_variable
                          )

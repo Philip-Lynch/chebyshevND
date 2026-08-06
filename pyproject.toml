@@ -3,7 +3,7 @@ requires = ["setuptools"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "chebND"
+name = "ChebyshevND"
 version = "0.1.0"
 description = "Multidimensional Chebyshev interpolation"
 authors = [{ name = "Your Name", email = "you@example.com" }]

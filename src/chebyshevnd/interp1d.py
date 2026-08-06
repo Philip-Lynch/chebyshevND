@@ -1,7 +1,7 @@
 import numpy as np
 from scipy.fft import dct
-from chebND.clenshaw import clenshaw_1d
-from chebND.utils import chebyshev_nodes
+from .clenshaw import clenshaw_1d
+from .utils import chebyshev_nodes
 def compute_chebyshev_coefficients_1d(func_or_vals, a, b, N, kind='dct'):
     """
     Compute the Chebyshev coefficients of a function or discrete values on [-1, 1] scaled to [a, b].

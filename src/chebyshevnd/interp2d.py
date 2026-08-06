@@ -1,7 +1,7 @@
 import numpy as np
 from scipy.fft import dctn
-from chebND.clenshaw import clenshaw_1d, clenshaw_2d
-from chebND.utils import chebyshev_nodes, find_significant_coeffs_2d, compute_chebyshev_coefficients_nd
+from .clenshaw import clenshaw_1d, clenshaw_2d
+from .utils import chebyshev_nodes, find_significant_coeffs_2d, compute_chebyshev_coefficients_nd
 
 class ChebyshevInterpolant2D:
     def __init__(self, vals, ax = -1., bx = 1., ay = -1., by = 1., nodes = 'Chebyshev'):
