@@ -1,6 +1,8 @@
 # ChebyshevND
 
 [![Tests](https://github.com/Philip-Lynch/chebyshevND/actions/workflows/tests.yml/badge.svg)](https://github.com/Philip-Lynch/chebyshevND/actions/workflows/tests.yml)
+[![Documentation](https://readthedocs.org/projects/chebyshevnd/badge/?version=latest)](https://chebyshevnd.readthedocs.io/en/latest/)
+[![PyPI](https://img.shields.io/pypi/v/chebyshevnd)](https://pypi.org/project/ChebyshevND/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 Fast multidimensional Chebyshev interpolation in Python, using DCTs to compute
