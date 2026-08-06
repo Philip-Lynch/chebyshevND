@@ -188,14 +188,14 @@ def partial_clenshaw_4d(coeffs, x_value, a=-1., b=1., kmax = None):
 
         return temp_yzw
 
-def clenshaw_nd(xs, coeffs):
-    d = xs.shape[0]
+def _clenshaw_nd_unit(ts, coeffs):
+    d = ts.shape[0]
 
     # Base case
     if d == 1:
-        return clenshaw_1d(coeffs, xs[0])
+        return clenshaw_1d(coeffs, ts[0])
 
-    x_last = xs[-1]
+    t_last = ts[-1]
     shape = coeffs.shape[:-1]
     tmp = np.empty(shape, dtype=np.float64)
 
@@ -205,7 +205,35 @@ def clenshaw_nd(xs, coeffs):
         idx = it.multi_index
         # Force 1D view along the last axis
         coeff_vec = coeffs[idx + (slice(None),)]
-        it[0] = clenshaw_1d(coeff_vec, x_last)
+        it[0] = clenshaw_1d(coeff_vec, t_last)
         it.iternext()
 
-    return clenshaw_nd(xs[:-1], tmp)
+    return _clenshaw_nd_unit(ts[:-1], tmp)
+
+
+def clenshaw_nd(coeffs, xs, a=None, b=None, kmax=None):
+    """
+    Evaluate an nD Chebyshev series at a single point.
+
+    Parameters:
+        coeffs : np.ndarray
+            nD array of Chebyshev coefficients.
+        xs : array-like
+            The n coordinates of the evaluation point, one per axis of coeffs.
+        a, b : array-like, optional
+            Per-axis lower and upper domain bounds (default [-1, 1] on every axis).
+        kmax : tuple, optional
+            Per-axis truncation counts; only coeffs[:kmax[0], ..., :kmax[n-1]] are used.
+
+    Returns:
+        float: value of the interpolant at xs.
+    """
+    xs = np.asarray(xs, dtype=np.float64)
+    d = coeffs.ndim
+    a = -np.ones(d) if a is None else np.asarray(a, dtype=np.float64)
+    b = np.ones(d) if b is None else np.asarray(b, dtype=np.float64)
+
+    ts = (2.0 * xs - a - b) / (b - a)
+    if kmax is not None:
+        coeffs = coeffs[tuple(slice(int(k)) for k in kmax)]
+    return _clenshaw_nd_unit(ts, coeffs)

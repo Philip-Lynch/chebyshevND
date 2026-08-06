@@ -1,76 +1,39 @@
 import numpy as np
 from scipy.fft import dct
 from .clenshaw import clenshaw_1d
-from .utils import chebyshev_nodes, chebyshev_gauss_lobatto_nodes
-def compute_chebyshev_coefficients_1d(func_or_vals, a, b, N, kind='dct'):
-    """
-    Compute the Chebyshev coefficients of a function or discrete values on [-1, 1] scaled to [a, b].
-    
-    Parameters:
-        func_or_vals: Callable or np.ndarray
-            Either a function f(x), or an array of y-values defined at Chebyshev points.
-        a, b: float
-            Domain bounds [a, b] over which interpolation is defined.
-        N: int
-            Number of Chebyshev points.
-        kind: str
-            'dct' (default) uses SciPy DCT-I to compute coefficients.
-
-    Returns:
-        coeffs: np.ndarray
-            Chebyshev coefficients.
-    """
-
-    if callable(func_or_vals):
-        x= chebyshev_nodes(N,a,b)
-        y = func_or_vals(x)
-    else:
-        y = np.asarray(func_or_vals)
-
-    # Compute Chebyshev coefficients using DCT-I (type 1)
-    coeffs = dct(y, type=2) / N 
-    coeffs[0] *= 0.5
-
-    return coeffs
 
 
 class ChebyshevInterpolant1D:
-    def __init__(self, func_or_vals, a, b, N, nodes = 'Chebyshev'):
+    def __init__(self, vals, a=-1., b=1., nodes='Chebyshev'):
         """
-        Construct a 1D Chebyshev interpolant.
+        Construct a 1D Chebyshev interpolant from values sampled on a Chebyshev grid.
 
         Parameters:
-            func_or_vals: Callable or array
-                Function f(x) or array of values at Chebyshev nodes.
-            a, b: float
+            vals : array-like
+                Function values sampled at the nodes of [a, b]:
+                chebyshev_nodes(N, a, b) for 'Chebyshev', or
+                chebyshev_gauss_lobatto_nodes(N, a, b) for 'GaussLobatto'.
+            a, b : float
                 Domain bounds [a, b].
-            N: int
-                Number of Chebyshev points.
+            nodes : str
+                Node family the values were sampled at: 'Chebyshev' or 'GaussLobatto'.
         """
         self.a = a
         self.b = b
-        self.N = N
 
-        if nodes == 'Chebyshev':
-            self.x_nodes = chebyshev_nodes(N, a, b)
-        elif nodes == 'GaussLobatto':
-            self.x_nodes = chebyshev_gauss_lobatto_nodes(N, a, b)
-        else:
-            raise ValueError('Incorrect node type. Please choose either Chebyshev or GaussLobatto')
-
-        if callable(func_or_vals):
-            y = func_or_vals(self.x_nodes)
-        else:
-            y = np.asarray(func_or_vals)
+        y = np.asarray(vals)
+        self.N = len(y)
 
         # To make this work with end points, use type=1, divide by N-1 and 0.5*coeff[-1]
         if nodes == 'Chebyshev':
-            self.coeffs = dct(y, type=2) / N
+            self.coeffs = dct(y, type=2) / self.N
             self.coeffs[0] *= 0.5
-        else:
-            self.coeffs = dct(y, type=1, norm = None) /(N-1)
+        elif nodes == 'GaussLobatto':
+            self.coeffs = dct(y, type=1, norm = None) / (self.N - 1)
             self.coeffs[0] *= 0.5
             self.coeffs[-1] *= 0.5
+        else:
+            raise ValueError('Incorrect node type. Please choose either Chebyshev or GaussLobatto')
 
         self.absErr = max(abs(self.coeffs[-1]), abs(self.coeffs[-2]))
         self.maxCoeff = max(abs(self.coeffs))
@@ -81,37 +44,38 @@ class ChebyshevInterpolant1D:
     def get_coefficients(self):
         """
         Get the Chebyshev coefficients of the interpolant.
-        
+
         Returns:
             np.ndarray: Chebyshev coefficients.
         """
         return self.coeffs
+
     def absolute_error(self):
         """
-        Compute the absolute error of the interpolant at point x.
-        
+        Estimate the absolute error of the interpolant from its trailing coefficients.
+
         Returns:
-            float: Absolute error at the Chebyshev nodes.
-        """ 
-
-
+            float: Absolute error estimate.
+        """
         return self.absErr
 
     def relative_error(self):
         """
-        Compute the relative error of the interpolant at point x.
-        
+        Estimate the relative error of the interpolant from its trailing coefficients.
+
         Returns:
-            float: Relative error at the Chebyshev nodes.
+            float: Relative error estimate.
         """
         return self.relErr
-        
 
     def evaluate(self, x):
-        """Evaluate the interpolant at x (scalar or array)."""
-        x = np.atleast_1d(x)
-        return np.array([clenshaw_1d(self.coeffs,xi,self.k_max, self.a, self.b) for xi in x])
-    
+        """Evaluate the interpolant at x: a scalar returns a float, an array returns an array."""
+        x_arr = np.atleast_1d(x)
+        result = np.array([clenshaw_1d(self.coeffs, xi, self.k_max, self.a, self.b) for xi in x_arr])
+        if np.ndim(x) == 0:
+            return float(result[0])
+        return result
+
     def optimize(self, rel_tol=1e-6):
         """
         Truncate the Chebyshev series by dropping insignificant trailing coefficients.

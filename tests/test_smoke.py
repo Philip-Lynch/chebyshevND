@@ -14,8 +14,8 @@ from chebyshevnd import (
     ChebyshevInterpolant4D,
     clenshaw_1d,
     chebyshev_nodes,
+    chebyshev_gauss_lobatto_nodes,
 )
-from chebyshevnd.utils import chebyshev_gauss_lobatto_nodes
 
 
 def cheb_grid_values(f, domains, Ns):
@@ -43,22 +43,14 @@ def test_clenshaw_1d_matches_numpy_chebval():
         assert result == pytest.approx(expected, rel=1e-12)
 
 
-def test_1d_interpolant_from_function():
+def test_1d_interpolant():
     f = lambda x: np.exp(x) * np.sin(2 * x)
     a, b = 0.0, 2.0
-    interp = ChebyshevInterpolant1D(f, a, b, N=32)
+    vals = f(chebyshev_nodes(32, a, b))
+    interp = ChebyshevInterpolant1D(vals, a, b)
     x_test = np.linspace(a, b, 17)
     err = np.max(np.abs(interp.evaluate(x_test) - f(x_test)))
     assert err < 1e-8
-
-
-def test_1d_interpolant_from_values_matches_function_input():
-    f = lambda x: 1.0 / (1.0 + x**2)
-    a, b, N = -1.0, 1.0, 40
-    vals = f(chebyshev_nodes(N, a, b))
-    from_func = ChebyshevInterpolant1D(f, a, b, N=N)
-    from_vals = ChebyshevInterpolant1D(vals, a, b, N=N)
-    np.testing.assert_allclose(from_vals.get_coefficients(), from_func.get_coefficients())
 
 
 def test_2d_interpolant():

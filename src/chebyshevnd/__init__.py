@@ -4,18 +4,17 @@ ChebyshevND: Fast multidimensional Chebyshev interpolation in Python.
 Currently supports up to 4D interpolation. Higher dimensions coming soon!
 """
 
-# Core interpolant class (1D)
+# Core interpolant classes
 from .interp1d import ChebyshevInterpolant1D
 from .interp2d import ChebyshevInterpolant2D
 from .interp3d import ChebyshevInterpolant3D
 from .interp4d import ChebyshevInterpolant4D
 
-# Core 1D Interpolation API
-from .interp1d import compute_chebyshev_coefficients_1d
-from .clenshaw import(clenshaw_1d, 
-                       clenshaw_2d, 
+# Clenshaw evaluation kernels
+from .clenshaw import(clenshaw_1d,
+                       clenshaw_2d,
                        clenshaw_3d,
-                       clenshaw_4d, 
+                       clenshaw_4d,
                        clenshaw_nd
 )
 
@@ -27,6 +26,7 @@ from .utils import (
     renormalize_coefficients_Chebyshev,
     compute_chebyshev_coefficients_nd,
     chebyshev_nodes,
+    chebyshev_gauss_lobatto_nodes,
     prune_trailing_slices_greedy_nd
 )
 
@@ -35,7 +35,6 @@ __all__ = [
     "ChebyshevInterpolant2D",
     "ChebyshevInterpolant3D",
     "ChebyshevInterpolant4D",
-    "compute_chebyshev_coefficients_1d",
     "clenshaw_1d",
     "clenshaw_2d",
     "clenshaw_3d",
@@ -47,5 +46,6 @@ __all__ = [
     "renormalize_coefficients_Chebyshev",
     "compute_chebyshev_coefficients_nd",
     "chebyshev_nodes",
+    "chebyshev_gauss_lobatto_nodes",
     "prune_trailing_slices_greedy_nd"
 ]

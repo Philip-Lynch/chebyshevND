@@ -96,7 +96,25 @@ def test_clenshaw_nd_matches_direct_sum(rng):
         coeffs = decaying_coeffs(rng, shape)
         ts = rng.uniform(-1.0, 1.0, size=len(shape))
         expected = direct_eval(coeffs, ts)
-        assert clenshaw_nd(ts, coeffs) == pytest.approx(expected, rel=1e-12, abs=1e-14)
+        assert clenshaw_nd(coeffs, ts) == pytest.approx(expected, rel=1e-12, abs=1e-14)
+
+
+def test_clenshaw_nd_with_domains(rng):
+    coeffs = decaying_coeffs(rng, (4, 5, 3))
+    doms = [(0.0, 2.0), (-3.0, 1.0), (1.0, 1.5)]
+    a = [lo for lo, _ in doms]
+    b = [hi for _, hi in doms]
+    point = np.array([1.3, -0.7, 1.1])
+    ts = [scale_to_unit(p, lo, hi) for p, (lo, hi) in zip(point, doms)]
+    expected = direct_eval(coeffs, ts)
+    assert clenshaw_nd(coeffs, point, a=a, b=b) == pytest.approx(expected, rel=1e-12, abs=1e-14)
+
+
+def test_clenshaw_nd_kmax_trims(rng):
+    coeffs = decaying_coeffs(rng, (6, 6))
+    ts = np.array([0.3, -0.2])
+    expected = direct_eval(coeffs[:4, :3], ts)
+    assert clenshaw_nd(coeffs, ts, kmax=(4, 3)) == pytest.approx(expected, rel=1e-12, abs=1e-14)
 
 
 def test_partial_clenshaw_4d_consistent_with_full(rng):

@@ -2,8 +2,7 @@
 
 import numpy as np
 
-from chebyshevnd import chebyshev_nodes
-from chebyshevnd.utils import chebyshev_gauss_lobatto_nodes
+from chebyshevnd import chebyshev_nodes, chebyshev_gauss_lobatto_nodes
 
 
 def scale_to_unit(x, a, b):
