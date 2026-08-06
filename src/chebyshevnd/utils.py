@@ -152,7 +152,7 @@ def compute_chebyshev_coefficients_nd(f_values: np.ndarray,nodes = 'Chebyshev') 
         coeffs = dctn(f_values, type=1, norm=None)
         coeffs = renormalize_coefficients_GL(coeffs)
     else:
-        ValueError('Incorrect node type. Please choose either Chebyshev or GaussLobatto')
+        raise ValueError('Incorrect node type. Please choose either Chebyshev or GaussLobatto')
     return coeffs
 # Adaptive Clenshaw algorithm for 1D Chebyshev polynomial evaluation
 # Eliminating insignificant coefficients to speed up the evaluation
@@ -246,7 +246,11 @@ def prune_trailing_slices_greedy_nd(coeffs, delta=1e-10, scale='max'):
     return tuple(kmax), discarded
 
 def find_significant_coeffs_1d(coefficients, rel_tol=1e-8, max_coeff=None, x_max_minus_i=1.):
-
+    """
+    Return the number of leading coefficients to keep (a count, not an index):
+    everything from the last coefficient above the significance threshold down.
+    Returns 0 if no coefficient is significant.
+    """
     if max_coeff is None:
         max_coeff = np.max(np.abs(coefficients))
 
@@ -255,10 +259,10 @@ def find_significant_coeffs_1d(coefficients, rel_tol=1e-8, max_coeff=None, x_max
     n = len(coefficients)
     for i in range(n - 1, -1, -1):
         if abs(coefficients[i]) > (rel_tol * max_coeff) /x_max_minus_i/(n):
-            nymax = i
+            nymax = i + 1
             break
     else:
-        return 0  # If all coefficients are below tol, return 0
+        return 0  # If all coefficients are below tol, keep none
 
     return nymax
 

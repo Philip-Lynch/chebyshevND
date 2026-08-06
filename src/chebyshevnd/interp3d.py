@@ -66,11 +66,11 @@ class ChebyshevInterpolant3D:
         Returns:
             float: Absolute error at the Chebyshev nodes.
         """
-        y_max = np.max([np.abs(self.coeffs[:, -2,:])*(self.Nx - 1),(np.abs(self.coeffs[:, -1,:]) * (self.Nx))])
-        x_max = np.max([np.abs(self.coeffs[-2, :,:])*(self.Ny - 1),(np.abs(self.coeffs[-1, :,:]) * (self.Ny))])
-        z_max = np.max([np.abs(self.coeffs[:, :, -2])*(self.Nz - 1),(np.abs(self.coeffs[:, :, -1]) * (self.Nz))])
-        abs_error = np.max([y_max, x_max,z_max])
-        return abs_error
+        err = 0.0
+        for axis, N in enumerate(self.coeffs.shape):
+            c = np.moveaxis(self.coeffs, axis, 0)
+            err = max(err, np.max(np.abs(c[-2])) * (N - 1), np.max(np.abs(c[-1])) * N)
+        return err
 
     def relative_error(self):
         """

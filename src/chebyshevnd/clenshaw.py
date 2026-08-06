@@ -21,8 +21,9 @@ def clenshaw_1d(coeffs, x,  k_max=None, a=-1.0, b=1.0):
     """
     if k_max is None:
         k_max = len(coeffs)
-    
-    
+    if k_max <= 0:
+        return 0.0
+
     # Map x from [a, b] to [-1, 1]
     xt = (2.0 * x - a - b) / (b - a)
     

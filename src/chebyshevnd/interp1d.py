@@ -1,7 +1,7 @@
 import numpy as np
 from scipy.fft import dct
 from .clenshaw import clenshaw_1d
-from .utils import chebyshev_nodes
+from .utils import chebyshev_nodes, chebyshev_gauss_lobatto_nodes
 def compute_chebyshev_coefficients_1d(func_or_vals, a, b, N, kind='dct'):
     """
     Compute the Chebyshev coefficients of a function or discrete values on [-1, 1] scaled to [a, b].
@@ -51,28 +51,32 @@ class ChebyshevInterpolant1D:
         self.b = b
         self.N = N
 
-        if callable(func_or_vals):
+        if nodes == 'Chebyshev':
             self.x_nodes = chebyshev_nodes(N, a, b)
+        elif nodes == 'GaussLobatto':
+            self.x_nodes = chebyshev_gauss_lobatto_nodes(N, a, b)
+        else:
+            raise ValueError('Incorrect node type. Please choose either Chebyshev or GaussLobatto')
+
+        if callable(func_or_vals):
             y = func_or_vals(self.x_nodes)
         else:
             y = np.asarray(func_or_vals)
 
         # To make this work with end points, use type=1, divide by N-1 and 0.5*coeff[-1]
         if nodes == 'Chebyshev':
-        
             self.coeffs = dct(y, type=2) / N
             self.coeffs[0] *= 0.5
-        elif nodes == 'GaussLobatto':
+        else:
             self.coeffs = dct(y, type=1, norm = None) /(N-1)
             self.coeffs[0] *= 0.5
             self.coeffs[-1] *= 0.5
-        else:
-            ValueError('Incorrect node type. Please choose either Chebyshev or GaussLobatto')
 
         self.absErr = max(abs(self.coeffs[-1]), abs(self.coeffs[-2]))
         self.maxCoeff = max(abs(self.coeffs))
         self.relErr = self.absErr/self.maxCoeff
-        self.k_max = len(self.coeffs) - 1
+        # Number of leading coefficients used by evaluate(); a count, not an index
+        self.k_max = len(self.coeffs)
 
     def get_coefficients(self):
         """
@@ -110,22 +114,21 @@ class ChebyshevInterpolant1D:
     
     def optimize(self, rel_tol=1e-6):
         """
-        Optimize the Chebyshev coefficients by removing small ones.
-        
+        Truncate the Chebyshev series by dropping insignificant trailing coefficients.
+
         Parameters:
             rel_tol: float
                 Relative tolerance for coefficient significance.
-        
-        Returns:
-            np.ndarray: Positions of significant coefficients.
+
+        Sets self.k_max to the number of leading coefficients that evaluate() uses.
         """
         if rel_tol < self.relErr:
             raise ValueError("Relative tolerance must be greater than the relative error of the interpolant.")
-        
-        k_max = len(self.coeffs) - 1
+
+        k_max = 1
         for k in range(len(self.coeffs) - 1, -1, -1):
             if abs(self.coeffs[k]) > rel_tol * self.maxCoeff:
-                k_max = k
+                k_max = k + 1
                 break
-                
+
         self.k_max = k_max
