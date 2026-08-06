@@ -1,0 +1,12 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it using the metadata below."
+title: "ChebyshevND: fast multidimensional Chebyshev interpolation in Python"
+type: software
+authors:
+  - family-names: Lynch
+    given-names: Philip
+    email: philip.lynch@aei.mpg.de
+    affiliation: "Max Planck Institute for Gravitational Physics (Albert Einstein Institute)"
+repository-code: "https://github.com/Philip-Lynch/chebyshevND"
+license: MIT
+version: 0.1.0

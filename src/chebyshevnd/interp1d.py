@@ -1,22 +1,33 @@
+"""1D Chebyshev interpolation."""
+
 import numpy as np
 from scipy.fft import dct
 from .clenshaw import clenshaw_1d
 
 
 class ChebyshevInterpolant1D:
+    """
+    Chebyshev interpolant of a function of one variable on [a, b].
+
+    Coefficients are computed from sampled values with a single DCT, and
+    evaluation uses Clenshaw's algorithm.
+    """
+
     def __init__(self, vals, a=-1., b=1., nodes='Chebyshev'):
         """
         Construct a 1D Chebyshev interpolant from values sampled on a Chebyshev grid.
 
-        Parameters:
-            vals : array-like
-                Function values sampled at the nodes of [a, b]:
-                chebyshev_nodes(N, a, b) for 'Chebyshev', or
-                chebyshev_gauss_lobatto_nodes(N, a, b) for 'GaussLobatto'.
-            a, b : float
-                Domain bounds [a, b].
-            nodes : str
-                Node family the values were sampled at: 'Chebyshev' or 'GaussLobatto'.
+        Parameters
+        ----------
+        vals : array-like
+            Function values sampled at the nodes of [a, b]:
+            ``chebyshev_nodes(N, a, b)`` for 'Chebyshev', or
+            ``chebyshev_gauss_lobatto_nodes(N, a, b)`` for 'GaussLobatto'.
+        a, b : float, optional
+            Domain bounds. Default [-1, 1].
+        nodes : str, optional
+            Node family the values were sampled at: 'Chebyshev' (default) or
+            'GaussLobatto'.
         """
         self.a = a
         self.b = b
@@ -45,8 +56,10 @@ class ChebyshevInterpolant1D:
         """
         Get the Chebyshev coefficients of the interpolant.
 
-        Returns:
-            np.ndarray: Chebyshev coefficients.
+        Returns
+        -------
+        np.ndarray
+            1D array of Chebyshev coefficients.
         """
         return self.coeffs
 
@@ -54,8 +67,10 @@ class ChebyshevInterpolant1D:
         """
         Estimate the absolute error of the interpolant from its trailing coefficients.
 
-        Returns:
-            float: Absolute error estimate.
+        Returns
+        -------
+        float
+            Absolute error estimate.
         """
         return self.absErr
 
@@ -63,13 +78,27 @@ class ChebyshevInterpolant1D:
         """
         Estimate the relative error of the interpolant from its trailing coefficients.
 
-        Returns:
-            float: Relative error estimate.
+        Returns
+        -------
+        float
+            Relative error estimate.
         """
         return self.relErr
 
     def evaluate(self, x):
-        """Evaluate the interpolant at x: a scalar returns a float, an array returns an array."""
+        """
+        Evaluate the interpolant.
+
+        Parameters
+        ----------
+        x : float or array-like
+            Point(s) in [a, b] at which to evaluate.
+
+        Returns
+        -------
+        float or np.ndarray
+            A float for scalar input, an array for array input.
+        """
         x_arr = np.atleast_1d(x)
         result = np.array([clenshaw_1d(self.coeffs, xi, self.k_max, self.a, self.b) for xi in x_arr])
         if np.ndim(x) == 0:
@@ -80,11 +109,14 @@ class ChebyshevInterpolant1D:
         """
         Truncate the Chebyshev series by dropping insignificant trailing coefficients.
 
-        Parameters:
-            rel_tol: float
-                Relative tolerance for coefficient significance.
+        Sets ``self.k_max`` to the number of leading coefficients that
+        ``evaluate()`` uses.
 
-        Sets self.k_max to the number of leading coefficients that evaluate() uses.
+        Parameters
+        ----------
+        rel_tol : float, optional
+            Relative tolerance for coefficient significance. Must be larger
+            than the relative error of the interpolant.
         """
         if rel_tol < self.relErr:
             raise ValueError("Relative tolerance must be greater than the relative error of the interpolant.")

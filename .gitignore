@@ -73,6 +73,8 @@ instance/
 
 # Sphinx documentation
 docs/_build/
+# Example notebooks copied into the docs tree at build time (see docs/conf.py)
+docs/examples/
 
 # PyBuilder
 .pybuilder/

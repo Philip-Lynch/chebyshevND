@@ -1,23 +1,31 @@
+"""Clenshaw evaluation kernels for tensor-product Chebyshev series in 1D-4D and nD."""
 
 import numpy as np
 from numba import njit
 from .utils import rescale_variable
 
+
 @njit
-def clenshaw_1d(coeffs, x,  k_max=None, a=-1.0, b=1.0):
+def clenshaw_1d(coeffs, x, k_max=None, a=-1.0, b=1.0):
     """
-    Evaluate Chebyshev series at a single point x using Clenshaw's algorithm.
-    
-    Parameters:
-        coeffs: array of Chebyshev coefficients
-        x: point of evaluation in [a, b]
-        a, b: domain bounds (default [-1, 1])
-        k_max : int, optional
-            Number of coefficients to use (truncate at this order).
-            Defaults to len(coeffs).
-    
-    Returns:
-        interpolated value at x
+    Evaluate a 1D Chebyshev series at a single point using Clenshaw's algorithm.
+
+    Parameters
+    ----------
+    coeffs : np.ndarray
+        1D array of Chebyshev coefficients.
+    x : float
+        Evaluation point in [a, b].
+    k_max : int, optional
+        Number of leading coefficients to use (a count, not an index).
+        Defaults to ``len(coeffs)``.
+    a, b : float, optional
+        Domain bounds. Default [-1, 1].
+
+    Returns
+    -------
+    float
+        Value of the Chebyshev series at x.
     """
     if k_max is None:
         k_max = len(coeffs)
@@ -26,7 +34,7 @@ def clenshaw_1d(coeffs, x,  k_max=None, a=-1.0, b=1.0):
 
     # Map x from [a, b] to [-1, 1]
     xt = (2.0 * x - a - b) / (b - a)
-    
+
     b_k1 = 0.0
     b_k2 = 0.0
     for k in range(k_max-1, 0, -1):
@@ -35,29 +43,31 @@ def clenshaw_1d(coeffs, x,  k_max=None, a=-1.0, b=1.0):
         b_k1 = b_k
     return coeffs[0] + xt * b_k1 - b_k2
 
+
 @njit
 def clenshaw_2d(coeffs, x, y, NyMaxes = None, ax = -1., bx=1, ay=-1., by=1):
     """
-    Evaluate a 2D Chebyshev interpolant using the Clenshaw algorithm.
+    Evaluate a 2D Chebyshev series at a single point using nested Clenshaw recursions.
 
-    Parameters:
+    Parameters
+    ----------
+    coeffs : np.ndarray
+        2D array of Chebyshev coefficients, shape (Nx, Ny).
+    x, y : float
+        Evaluation point.
+    NyMaxes : np.ndarray of int64, optional
+        Per-row truncation counts: row i uses only its first NyMaxes[i]
+        coefficients, and only the first ``len(NyMaxes)`` rows are used.
+        Defaults to the full coefficient array.
+    ax, bx : float, optional
+        Domain bounds in x. Default [-1, 1].
+    ay, by : float, optional
+        Domain bounds in y. Default [-1, 1].
 
-        coeffs : 2D np.ndarray
-            Matrix of Chebyshev coefficients [Nx, Ny].
-        x, y : float
-            Point to evaluate.
-        Nx : int, optional
-            Number of Chebyshev points in x-direction. If None, defaults to shape(coeffs)[0].
-        Ny : int, optional
-            Number of Chebyshev points in y-direction. If None, defaults to shape(coeffs)[1].
-        ax, bx : float
-            Domain bounds in x-direction.
-        ay, by : float
-            Domain bounds in y-direction.
-
-    Returns:
-        float
-            Value of interpolant at (x, y)
+    Returns
+    -------
+    float
+        Value of the Chebyshev series at (x, y).
     """
     if NyMaxes is None:
         NyMaxes = np.ones(coeffs.shape[0], dtype=np.int64) * coeffs.shape[1]
@@ -68,43 +78,36 @@ def clenshaw_2d(coeffs, x, y, NyMaxes = None, ax = -1., bx=1, ay=-1., by=1):
 
     # Evaluate in y-direction first for each fixed x
     temp = np.array([clenshaw_1d(coeffs[i, :], ty,NyMaxes[i]) for i in range(NyMaxes.shape[0])])
-    
+
     # Then evaluate resulting 1D Chebyshev series in x-direction
     return clenshaw_1d(temp, tx,NyMaxes.shape[0])
 
-''' 
+
 @njit
-def clenshaw_3d(coeffs, x, y, z, kmax=None,
-                ax=-1., bx=1., ay=-1., by=1., az=-1., bz=1.):
-    """
-    3D Clenshaw, reusing clenshaw_2d inside.
-    """
-    # Nx, Ny, Nz = coeffs.shape
-    if kmax is None:
-        kmax = coeffs.shape
-
-    # Map z
-    tz = (2 * z - (bz + az)) / (bz - az)
-    NzMaxes = np.ones((kmax[0], kmax[1]), dtype=np.int64) * kmax[2]
-    # Evaluate along z for each (i, j)
-    temp_xy = np.empty((kmax[0], kmax[1]))
-    for i in range(kmax[0]):
-        for j in range(kmax[1]):
-            temp_xy[i, j] = clenshaw_1d(coeffs[i, j, :], tz, NzMaxes[i, j])
-
-    # Now evaluate the 2D interpolant in (x, y)
-    return clenshaw_2d(temp_xy, x, y, ax=ax, bx=bx, ay=ay, by=by)
-
-''' 
-@njit
-def clenshaw_3d(coeffs, x, y, z, 
-                ax = -1., bx = 1., 
-                ay = -1., by = 1., 
+def clenshaw_3d(coeffs, x, y, z,
+                ax = -1., bx = 1.,
+                ay = -1., by = 1.,
                 az = -1., bz = 1.,
                 kmax=None):
     """
-    coeffs: (nx,ny,nz) full coefficients (you may pass a trimmed block)
-    kmax: (ix,iy,iz) optional; if None uses coeffs.shape
+    Evaluate a 3D Chebyshev series at a single point using nested Clenshaw recursions.
+
+    Parameters
+    ----------
+    coeffs : np.ndarray
+        3D array of Chebyshev coefficients, shape (Nx, Ny, Nz).
+    x, y, z : float
+        Evaluation point.
+    ax, bx, ay, by, az, bz : float, optional
+        Per-axis domain bounds. Default [-1, 1] on every axis.
+    kmax : tuple of int, optional
+        Per-axis truncation counts (ix, iy, iz); only
+        ``coeffs[:ix, :iy, :iz]`` is used. Defaults to ``coeffs.shape``.
+
+    Returns
+    -------
+    float
+        Value of the Chebyshev series at (x, y, z).
     """
     nx, ny, nz = coeffs.shape
     if kmax is None:
@@ -131,13 +134,33 @@ def clenshaw_3d(coeffs, x, y, z,
     # Finally along x using only [:ix]
     return clenshaw_1d(tmp_x[:ix], tx)
 
+
 @njit
 def clenshaw_4d(coeffs, x, y, z, w,
                 ax=-1., bx=1., ay=-1., by=1.,
                 az=-1., bz=1., aw=-1., bw=1.,
                 kmax=None):
     """
-    4D Clenshaw, reusing clenshaw_3d inside.
+    Evaluate a 4D Chebyshev series at a single point using nested Clenshaw recursions.
+
+    Collapses the w axis, then delegates to :func:`clenshaw_3d`.
+
+    Parameters
+    ----------
+    coeffs : np.ndarray
+        4D array of Chebyshev coefficients, shape (Nx, Ny, Nz, Nw).
+    x, y, z, w : float
+        Evaluation point.
+    ax, bx, ay, by, az, bz, aw, bw : float, optional
+        Per-axis domain bounds. Default [-1, 1] on every axis.
+    kmax : tuple of int, optional
+        Per-axis truncation counts (ix, iy, iz, iw); only
+        ``coeffs[:ix, :iy, :iz, :iw]`` is used. Defaults to ``coeffs.shape``.
+
+    Returns
+    -------
+    float
+        Value of the Chebyshev series at (x, y, z, w).
     """
     Nx, Ny, Nz, Nw = coeffs.shape
 
@@ -165,30 +188,51 @@ def clenshaw_4d(coeffs, x, y, z, w,
 
 @njit
 def partial_clenshaw_4d(coeffs, x_value, a=-1., b=1., kmax = None):
-        """
-        Collapse x dimension at fixed x_value.
-        Returns a 3D array of effective coefficients in (y, z, w).
-        """
-        tx = rescale_variable(x_value, a, b)
+    """
+    Collapse the leading (x) axis of a 4D Chebyshev series at a fixed x value.
 
-        Nx, Ny, Nz, Nw = coeffs.shape
+    The result is an effective 3D coefficient array in (y, z, w) that can be
+    evaluated repeatedly with :func:`clenshaw_3d`, which is cheaper than
+    calling :func:`clenshaw_4d` when x is held fixed.
 
-        if kmax is None:
-            ix, iy, iz,iw = Nx, Ny, Nz, Nw
-        else:
-            ix, iy, iz, iw = kmax
+    Parameters
+    ----------
+    coeffs : np.ndarray
+        4D array of Chebyshev coefficients, shape (Nx, Ny, Nz, Nw).
+    x_value : float
+        The fixed x value at which to collapse the leading axis.
+    a, b : float, optional
+        Domain bounds in x. Default [-1, 1].
+    kmax : tuple of int, optional
+        Per-axis truncation counts (ix, iy, iz, iw). Defaults to ``coeffs.shape``.
 
-        temp_yzw = np.empty((iy, iz, iw))
+    Returns
+    -------
+    np.ndarray
+        3D array of effective coefficients in (y, z, w), shape (iy, iz, iw).
+    """
+    tx = rescale_variable(x_value, a, b)
 
-        for j in range(iy):
-            for k in range(iz):
-                for l in range(iw):
-                    coeffs_x = coeffs[:Nx, j, k, l]
-                    temp_yzw[j, k, l] = clenshaw_1d(coeffs_x, tx)
+    Nx, Ny, Nz, Nw = coeffs.shape
 
-        return temp_yzw
+    if kmax is None:
+        ix, iy, iz,iw = Nx, Ny, Nz, Nw
+    else:
+        ix, iy, iz, iw = kmax
+
+    temp_yzw = np.empty((iy, iz, iw))
+
+    for j in range(iy):
+        for k in range(iz):
+            for l in range(iw):
+                coeffs_x = coeffs[:Nx, j, k, l]
+                temp_yzw[j, k, l] = clenshaw_1d(coeffs_x, tx)
+
+    return temp_yzw
+
 
 def _clenshaw_nd_unit(ts, coeffs):
+    """Recursively evaluate an nD Chebyshev series at a point already scaled to [-1, 1]^n."""
     d = ts.shape[0]
 
     # Base case
@@ -215,18 +259,22 @@ def clenshaw_nd(coeffs, xs, a=None, b=None, kmax=None):
     """
     Evaluate an nD Chebyshev series at a single point.
 
-    Parameters:
-        coeffs : np.ndarray
-            nD array of Chebyshev coefficients.
-        xs : array-like
-            The n coordinates of the evaluation point, one per axis of coeffs.
-        a, b : array-like, optional
-            Per-axis lower and upper domain bounds (default [-1, 1] on every axis).
-        kmax : tuple, optional
-            Per-axis truncation counts; only coeffs[:kmax[0], ..., :kmax[n-1]] are used.
+    Parameters
+    ----------
+    coeffs : np.ndarray
+        nD array of Chebyshev coefficients.
+    xs : array-like
+        The n coordinates of the evaluation point, one per axis of coeffs.
+    a, b : array-like, optional
+        Per-axis lower and upper domain bounds. Default [-1, 1] on every axis.
+    kmax : tuple of int, optional
+        Per-axis truncation counts; only ``coeffs[:kmax[0], ..., :kmax[n-1]]``
+        is used.
 
-    Returns:
-        float: value of the interpolant at xs.
+    Returns
+    -------
+    float
+        Value of the Chebyshev series at xs.
     """
     xs = np.asarray(xs, dtype=np.float64)
     d = coeffs.ndim

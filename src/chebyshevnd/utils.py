@@ -1,27 +1,48 @@
+"""Node generation, coefficient computation, and pruning utilities."""
+
 import numpy as np
-import scipy.fft
 from scipy.fft import dctn
 from numba import njit
 
+
 @njit
 def rescale_variable(x, a, b):
-    # Function to rescale variable from [a, b] to [-1, 1]
+    """
+    Map x from [a, b] to [-1, 1].
+
+    Parameters
+    ----------
+    x : float
+        Point in [a, b].
+    a, b : float
+        Domain bounds.
+
+    Returns
+    -------
+    float
+        The image of x in [-1, 1].
+    """
     return 2 * (x - a) / (b - a) - 1
 
 
 def chebyshev_gauss_lobatto_nodes(N,a,b):
     """
-    Generate Chebyshev-Gauss-Lobatto nodes for N points.
-    This includes the endpoints a and b.
-    Parameters:
-        N: int
-            Number of Chebyshev points.
-        a, b: float
-            Domain bounds [a, b].
-    
-    Returns:
-        x: np.ndarray
-            Chebyshev-Gauss-Lobatto nodes in the interval [a, b].
+    Generate the N Chebyshev-Gauss-Lobatto (extrema) nodes on [a, b].
+
+    These are the extrema of the Chebyshev polynomial T_{N-1} and include
+    the endpoints a and b. The nodes are returned in descending order.
+
+    Parameters
+    ----------
+    N : int
+        Number of nodes.
+    a, b : float
+        Domain bounds.
+
+    Returns
+    -------
+    np.ndarray
+        Chebyshev-Gauss-Lobatto nodes in [a, b].
     """
     # Chebyshev-Gauss-Lobatto nodes on [-1, 1]
     x_cheb =  np.cos(np.pi * np.arange(N) / (N - 1))
@@ -29,19 +50,25 @@ def chebyshev_gauss_lobatto_nodes(N,a,b):
     x = 0.5 * (b - a) * x_cheb + 0.5 * (a + b)
     return x
 
+
 def chebyshev_nodes(N,a,b):
     """
-    Generate Chebyshev nodes for N points.
-    This excludes the endpoints a and b.
-    Parameters:
-        N: int
-            Number of Chebyshev points.
-        a, b: float
-            Domain bounds [a, b].
-    
-    Returns:
-        x: np.ndarray
-            Chebyshev nodes in the interval [a, b].
+    Generate the N Chebyshev (root) nodes on [a, b].
+
+    These are the roots of the Chebyshev polynomial T_N and exclude the
+    endpoints a and b. The nodes are returned in descending order.
+
+    Parameters
+    ----------
+    N : int
+        Number of nodes.
+    a, b : float
+        Domain bounds.
+
+    Returns
+    -------
+    np.ndarray
+        Chebyshev nodes in (a, b).
     """
     # Chebyshev nodes on [-1, 1]
     x_cheb = np.cos(np.pi * (2*np.arange(N)+1) / (2*N))
@@ -49,26 +76,27 @@ def chebyshev_nodes(N,a,b):
     x = 0.5 * (b - a) * x_cheb + 0.5 * (a + b)
     return x
 
+
 def renormalize_coefficients_GL(coeffs,copy=True):
     """
-    Renormalise DCT-I (norm=None) output on an extrema (Gauss-Lobatto) tensor grid
-    to standard Chebyshev-series convention, for arbitrary dimension.
+    Renormalize raw DCT-I output on a Gauss-Lobatto (extrema) tensor grid to
+    standard Chebyshev-series convention, for arbitrary dimension.
 
     This generalises:
-      2D: divide by (Nx-1)(Ny-1), then halve rows/cols at indices 0 and -1
-      3D: divide by (Nx-1)(Ny-1)(Nz-1), then halve each of the 6 faces, etc.
+    2D: divide by (Nx-1)(Ny-1), then halve rows/cols at indices 0 and -1;
+    3D: divide by (Nx-1)(Ny-1)(Nz-1), then halve each of the 6 faces, etc.
 
     Parameters
     ----------
-    coeffs : ndarray, shape (N1, N2, ..., Nd)
-        Output of scipy.fft.dctn(..., type=1, norm=None).
-    copy : bool
-        If True, work on a copy and return it. If False, scale in-place.
+    coeffs : np.ndarray
+        Output of ``scipy.fft.dctn(..., type=1, norm=None)``, shape (N1, ..., Nd).
+    copy : bool, optional
+        If True (default), work on a copy and return it. If False, scale in place.
 
     Returns
     -------
-    ndarray
-        Renormalised Chebyshev coefficients (same shape as input).
+    np.ndarray
+        Renormalized Chebyshev coefficients, same shape as the input.
     """
     arr = coeffs.copy() if copy else coeffs
     shape = arr.shape
@@ -95,20 +123,21 @@ def renormalize_coefficients_GL(coeffs,copy=True):
 
     return arr
 
-# Code for renormalizing nD Chebyshev coefficients computed via DCT
+
 def renormalize_coefficients_Chebyshev(out: np.ndarray) -> np.ndarray:
     """
-    Renormalize an nD array of Chebyshev coefficients.
+    Renormalize raw DCT-II output on a Chebyshev (root) tensor grid to
+    standard Chebyshev-series convention, for arbitrary dimension.
 
     Parameters
     ----------
     out : np.ndarray
-        n-dimensional array of Chebyshev coefficients.
+        Output of ``scipy.fft.dctn(..., type=2, norm=None)``, n-dimensional.
 
     Returns
     -------
-    normalized : np.ndarray
-        Renormalized coefficients with the same shape as `out`.
+    np.ndarray
+        Renormalized Chebyshev coefficients, same shape as the input.
     """
     shape = out.shape
     ndim = out.ndim
@@ -128,22 +157,26 @@ def renormalize_coefficients_Chebyshev(out: np.ndarray) -> np.ndarray:
     normalized = out / (scale * np.prod(shape))
 
     return normalized
-    
 
-# Code for computing nD Chebyshev coefficients using DCT
+
 def compute_chebyshev_coefficients_nd(f_values: np.ndarray,nodes = 'Chebyshev') -> np.ndarray:
     """
-    Compute Chebyshev coefficients for an nD array of function values using DCT.
+    Compute Chebyshev coefficients for an nD array of function values using a DCT.
 
     Parameters
     ----------
     f_values : np.ndarray
-        n-dimensional array of function values on a Chebyshev tensor grid.
+        n-dimensional array of function values sampled on a Chebyshev tensor
+        grid of the chosen node family (``chebyshev_nodes`` along each axis
+        for 'Chebyshev', ``chebyshev_gauss_lobatto_nodes`` for 'GaussLobatto').
+    nodes : str, optional
+        Node family the values were sampled at: 'Chebyshev' (default) or
+        'GaussLobatto'.
 
     Returns
     -------
-    coeffs : np.ndarray
-        n-dimensional array of Chebyshev coefficients.
+    np.ndarray
+        n-dimensional array of Chebyshev coefficients, same shape as the input.
     """
     if(nodes == 'Chebyshev'):
         coeffs = dctn(f_values, type=2, norm=None)
@@ -154,35 +187,39 @@ def compute_chebyshev_coefficients_nd(f_values: np.ndarray,nodes = 'Chebyshev') 
     else:
         raise ValueError('Incorrect node type. Please choose either Chebyshev or GaussLobatto')
     return coeffs
-# Adaptive Clenshaw algorithm for 1D Chebyshev polynomial evaluation
-# Eliminating insignificant coefficients to speed up the evaluation
+
 
 def prune_trailing_slices_greedy_nd(coeffs, delta=1e-10, scale='max'):
     """
-    Structured pruning of nD Chebyshev coeffs by removing trailing slices
-    along axes to reduce Clenshaw lengths while controlling a global relative error.
+    Structured pruning of nD Chebyshev coefficients: greedily remove trailing
+    slices along axes to reduce Clenshaw lengths while controlling a global
+    relative error.
 
-    Error control: sum(|discarded coeffs|) <= delta * S, with S given by `scale`.
+    Error control: ``sum(|discarded coeffs|) <= delta * S``, with S given by
+    `scale`.
 
     Parameters
     ----------
-    coeffs : ndarray
+    coeffs : np.ndarray
         Chebyshev coefficients, n-dimensional.
-    delta : float
+    delta : float, optional
         Allowed global relative error.
-    scale : {'max','l1','l2', float}
+    scale : {'max', 'l1', 'l2'} or float, optional
         Scale S for the relative tolerance:
-          - 'max' (default): S = max(abs(coeffs))
-          - 'l1' : S = sum(abs(coeffs))
-          - 'l2' : S = norm(coeffs.ravel(), 2)
-          - float: use the provided value
+
+        - 'max' (default): ``S = max(abs(coeffs))``
+        - 'l1' : ``S = sum(abs(coeffs))``
+        - 'l2' : ``S = norm(coeffs.ravel(), 2)``
+        - float: use the provided value
 
     Returns
     -------
-    kmax : tuple
-        Truncation limits along each axis; keep coeffs[ :kmax[0], :kmax[1], ..., :kmax[n-1] ].
+    kmax : tuple of int
+        Per-axis truncation counts; keep
+        ``coeffs[:kmax[0], :kmax[1], ..., :kmax[n-1]]``.
     discarded_abs_sum : float
-        Sum of |coeffs| discarded (an upper bound on absolute uniform error).
+        Sum of |coeffs| discarded — an upper bound on the absolute uniform
+        error introduced by the truncation.
     """
     c = np.asarray(coeffs)
     shape = c.shape
@@ -245,11 +282,32 @@ def prune_trailing_slices_greedy_nd(coeffs, delta=1e-10, scale='max'):
 
     return tuple(kmax), discarded
 
+
 def find_significant_coeffs_1d(coefficients, rel_tol=1e-8, max_coeff=None, x_max_minus_i=1.):
     """
-    Return the number of leading coefficients to keep (a count, not an index):
-    everything from the last coefficient above the significance threshold down.
-    Returns 0 if no coefficient is significant.
+    Count how many leading 1D Chebyshev coefficients are worth keeping.
+
+    Scans from the tail for the last coefficient whose magnitude exceeds
+    ``rel_tol * max_coeff / (x_max_minus_i * len(coefficients))``.
+
+    Parameters
+    ----------
+    coefficients : np.ndarray
+        1D array of Chebyshev coefficients.
+    rel_tol : float, optional
+        Relative tolerance for coefficient significance.
+    max_coeff : float, optional
+        Reference magnitude for the relative threshold. Defaults to
+        ``max(abs(coefficients))``.
+    x_max_minus_i : float, optional
+        Extra scale factor used by the 2D routine to tighten the per-row
+        threshold. Leave at 1 for standalone use.
+
+    Returns
+    -------
+    int
+        Number of leading coefficients to keep (a count, not an index);
+        0 if no coefficient is significant.
     """
     if max_coeff is None:
         max_coeff = np.max(np.abs(coefficients))
@@ -267,10 +325,32 @@ def find_significant_coeffs_1d(coefficients, rel_tol=1e-8, max_coeff=None, x_max
     return nymax
 
 
-# Adaptive Clenshaw algorithm for 2D Chebyshev polynomial evaluation
-
 def find_significant_coeffs_2d(coefficients, rel_tol=1e-8,max_coeff=None, x_max_minus_i=1.):
+    """
+    Per-row truncation counts for a 2D Chebyshev coefficient matrix.
 
+    For each row i, counts the significant coefficients along the second
+    axis; trailing all-insignificant rows are trimmed from the result. The
+    returned array is suitable as the ``NyMaxes`` argument of
+    :func:`chebyshevnd.clenshaw.clenshaw_2d`.
+
+    Parameters
+    ----------
+    coefficients : np.ndarray
+        2D array of Chebyshev coefficients, shape (Nx, Ny).
+    rel_tol : float, optional
+        Relative tolerance for coefficient significance.
+    max_coeff : float, optional
+        Reference magnitude for the relative threshold. Defaults to
+        ``max(abs(coefficients))``.
+    x_max_minus_i : float, optional
+        Extra scale factor for the per-row threshold.
+
+    Returns
+    -------
+    np.ndarray of int64
+        Truncation count for each kept row (a count per row, not indices).
+    """
     nx, ny = coefficients.shape
     tmp = np.zeros(nx)
     nyMax = np.zeros(nx)
