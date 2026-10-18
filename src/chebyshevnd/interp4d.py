@@ -137,7 +137,9 @@ class ChebyshevInterpolant4D:
         slices while keeping the global relative error below `rel_tol`.
 
         Sets ``self.kmax``, the per-axis truncation counts that ``evaluate()``
-        uses to shorten the Clenshaw recursions.
+        uses to shorten the Clenshaw recursions. An x axis collapsed earlier
+        by ``precompute_x`` keeps its old truncation; call ``precompute_x``
+        again to use the new one.
 
         Parameters
         ----------
@@ -145,7 +147,6 @@ class ChebyshevInterpolant4D:
             Allowed global relative error of the truncation.
         """
         self.kmax = prune_trailing_slices_greedy_nd(self.coeffs, delta=rel_tol, scale='max')[0]
-        self.kmax_precomp = (self.kmax[1],self.kmax[2],self.kmax[3])
 
     def effective_grid(self):
         """

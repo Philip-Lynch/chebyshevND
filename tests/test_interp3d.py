@@ -87,6 +87,26 @@ def test_precompute_x_matches_evaluate_after_optimize():
         assert interp.evaluate_yz(y, z) == pytest.approx(interp.evaluate(x0, y, z), abs=1e-13)
 
 
+def test_optimize_after_precompute_keeps_collapsed_axis_consistent():
+    # Regression: optimize() after precompute_x() changed the truncation that
+    # evaluate_yz applied to the old collapsed array, so a larger new kmax read
+    # unset entries. evaluate_yz must keep evaluating the series that
+    # precompute_x collapsed until precompute_x is called again.
+    _, _, interp = build()
+    interp.optimize(rel_tol=1e-3)
+    x0 = 0.4
+    interp.precompute_x(x0)
+    points = sample_points(6)
+    expected = [interp.evaluate(x0, y, z) for _, y, z in points]
+    interp.optimize(rel_tol=1e-12)
+    got = [interp.evaluate_yz(y, z) for _, y, z in points]
+    np.testing.assert_allclose(got, expected, rtol=0, atol=1e-13)
+    # White-box: the truncation evaluate_yz applies must cover exactly the
+    # block precompute_x filled. Unset np.empty entries are often zero, so
+    # the value check above can pass by luck.
+    assert interp.precomp_x.shape == (len(interp.NyMaxes), interp.NyMaxes.max())
+
+
 def test_evaluate_yz_requires_precompute():
     _, _, interp = build(Ns=(8, 8, 8))
     with pytest.raises(ValueError):
