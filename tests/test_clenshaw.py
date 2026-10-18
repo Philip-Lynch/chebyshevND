@@ -137,3 +137,16 @@ def test_partial_clenshaw_4d_consistent_with_full(rng):
             az=doms[3][0], bz=doms[3][1],
         )
         assert partial == pytest.approx(full, rel=1e-12, abs=1e-14)
+
+
+def test_partial_clenshaw_4d_respects_x_truncation(rng):
+    # Regression: kmax[0] used to be ignored, so the collapsed coefficients
+    # always summed every x coefficient.
+    coeffs = decaying_coeffs(rng, (6, 4, 5, 4))
+    kmax = (3, 4, 4, 3)
+    x = 0.4
+    collapsed = partial_clenshaw_4d(coeffs, x, kmax=kmax)
+    for point in [(-0.3, 0.2, -0.5), (0.8, 0.7, 0.9)]:
+        full = clenshaw_4d(coeffs, x, *point, kmax=kmax)
+        partial = clenshaw_3d(collapsed, *point)
+        assert partial == pytest.approx(full, rel=1e-12, abs=1e-14)

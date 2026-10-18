@@ -225,7 +225,7 @@ def partial_clenshaw_4d(coeffs, x_value, a=-1., b=1., kmax = None):
     for j in range(iy):
         for k in range(iz):
             for l in range(iw):
-                coeffs_x = coeffs[:Nx, j, k, l]
+                coeffs_x = coeffs[:ix, j, k, l]
                 temp_yzw[j, k, l] = clenshaw_1d(coeffs_x, tx)
 
     return temp_yzw

@@ -67,9 +67,11 @@ def test_precompute_x_matches_evaluate_after_optimize():
     interp.optimize(rel_tol=1e-8)
     x0 = 0.6
     interp.precompute_x(x0)
+    # Both paths use the same truncated series, so they agree to rounding. A
+    # looser tolerance here used to hide precompute_x ignoring kmax[0].
     for _, y, z, w in sample_points(6):
         assert interp.evaluate_yzw(y, z, w) == pytest.approx(
-            interp.evaluate(x0, y, z, w), abs=1e-8
+            interp.evaluate(x0, y, z, w), abs=1e-13
         )
 
 
