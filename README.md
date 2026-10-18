@@ -129,6 +129,14 @@ pip install pytest
 pytest
 ```
 
+To compare per-call evaluation timings before and after a change (on the same
+machine):
+
+```bash
+python benchmarks/bench_evaluate.py              # prints a table
+python benchmarks/bench_evaluate.py --json out.json
+```
+
 ## Citation
 
 The techniques implemented in this package were derived and developed for:
