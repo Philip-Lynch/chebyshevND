@@ -5,7 +5,7 @@ from scipy.fft import dctn
 from numba import njit
 
 
-@njit
+@njit(cache=True)
 def rescale_variable(x, a, b):
     """
     Map x from [a, b] to [-1, 1].

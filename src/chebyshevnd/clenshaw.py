@@ -5,7 +5,7 @@ from numba import njit
 from .utils import rescale_variable
 
 
-@njit
+@njit(cache=True)
 def clenshaw_1d(coeffs, x, k_max=None, a=-1.0, b=1.0):
     """
     Evaluate a 1D Chebyshev series at a single point using Clenshaw's algorithm.
@@ -44,7 +44,7 @@ def clenshaw_1d(coeffs, x, k_max=None, a=-1.0, b=1.0):
     return coeffs[0] + xt * b_k1 - b_k2
 
 
-@njit
+@njit(cache=True)
 def clenshaw_2d(coeffs, x, y, NyMaxes = None, ax = -1., bx=1, ay=-1., by=1):
     """
     Evaluate a 2D Chebyshev series at a single point using nested Clenshaw recursions.
@@ -83,7 +83,7 @@ def clenshaw_2d(coeffs, x, y, NyMaxes = None, ax = -1., bx=1, ay=-1., by=1):
     return clenshaw_1d(temp, tx,NyMaxes.shape[0])
 
 
-@njit
+@njit(cache=True)
 def clenshaw_3d(coeffs, x, y, z,
                 ax = -1., bx = 1.,
                 ay = -1., by = 1.,
@@ -135,7 +135,7 @@ def clenshaw_3d(coeffs, x, y, z,
     return clenshaw_1d(tmp_x[:ix], tx)
 
 
-@njit
+@njit(cache=True)
 def clenshaw_4d(coeffs, x, y, z, w,
                 ax=-1., bx=1., ay=-1., by=1.,
                 az=-1., bz=1., aw=-1., bw=1.,
@@ -186,7 +186,7 @@ def clenshaw_4d(coeffs, x, y, z, w,
                        kmax = (ix, iy, iz))
 
 
-@njit
+@njit(cache=True)
 def partial_clenshaw_4d(coeffs, x_value, a=-1., b=1., kmax = None):
     """
     Collapse the leading (x) axis of a 4D Chebyshev series at a fixed x value.
