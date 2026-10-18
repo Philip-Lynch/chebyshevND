@@ -166,7 +166,7 @@ class ChebyshevInterpolant3D:
         for j in range(self.kmax[1]):
             for k in range(self.kmax[2]):
                 # pull the 1D coeffs in x for this (j, k)
-                coeffs_x = self.coeffs[:, j, k]
+                coeffs_x = self.coeffs[:self.kmax[0], j, k]
                 temp_yz[j, k] = clenshaw_1d(coeffs_x, tx)
 
         self.precomp_x = temp_yz

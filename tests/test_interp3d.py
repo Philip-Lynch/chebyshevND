@@ -78,10 +78,13 @@ def test_precompute_x_on_non_square_grid(Ns):
 def test_precompute_x_matches_evaluate_after_optimize():
     _, _, interp = build()
     interp.optimize(rel_tol=1e-8)
+    assert interp.kmax[0] < interp.Nx
     x0 = 0.4
     interp.precompute_x(x0)
+    # Both paths use the same truncated series, so they agree to rounding. A
+    # looser tolerance here used to hide precompute_x ignoring kmax[0].
     for _, y, z in sample_points(6):
-        assert interp.evaluate_yz(y, z) == pytest.approx(interp.evaluate(x0, y, z), abs=1e-9)
+        assert interp.evaluate_yz(y, z) == pytest.approx(interp.evaluate(x0, y, z), abs=1e-13)
 
 
 def test_evaluate_yz_requires_precompute():
