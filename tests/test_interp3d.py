@@ -64,6 +64,17 @@ def test_precompute_x_matches_full_evaluate():
         assert interp.evaluate_yz(y, z) == pytest.approx(interp.evaluate(x0, y, z), abs=1e-11)
 
 
+@pytest.mark.parametrize("Ns", [(12, 8, 10), (8, 12, 10)])
+def test_precompute_x_on_non_square_grid(Ns):
+    # Regression: before optimize(), evaluate_yz used Nx rows of the (Ny, Nz)
+    # precomputed array, giving NaN for Nx > Ny and dropping rows for Nx < Ny.
+    _, _, interp = build(Ns=Ns)
+    x0 = 1.3
+    interp.precompute_x(x0)
+    for _, y, z in sample_points(6):
+        assert interp.evaluate_yz(y, z) == pytest.approx(interp.evaluate(x0, y, z), abs=1e-13)
+
+
 def test_precompute_x_matches_evaluate_after_optimize():
     _, _, interp = build()
     interp.optimize(rel_tol=1e-8)

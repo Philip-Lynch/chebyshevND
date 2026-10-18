@@ -55,7 +55,7 @@ class ChebyshevInterpolant3D:
         self.max = np.max([np.abs(self.coeffs)])
         self.rel_error = self.abs_error / self.max
         self.kmax = (self.Nx,self.Ny,self.Nz)
-        self.NyMaxes = np.ones(self.Nx, dtype=np.int64) * self.Nz
+        self.NyMaxes = np.ones(self.Ny, dtype=np.int64) * self.Nz
 
     def evaluate(self, x, y,z):
         """
