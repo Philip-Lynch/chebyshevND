@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ChebyshevND"
-version = "0.1.0"
+version = "0.1.1"
 description = "Fast multidimensional Chebyshev interpolation using DCTs, Clenshaw recursions, and coefficient pruning"
 authors = [{ name = "Philip Lynch", email = "philip.lynch@aei.mpg.de" }]
 readme = "README.md"
