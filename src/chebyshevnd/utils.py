@@ -222,7 +222,7 @@ def prune_trailing_slices_greedy_nd(coeffs, delta=1e-10, scale='max'):
         Per-axis truncation counts; keep
         ``coeffs[:kmax[0], :kmax[1], ..., :kmax[n-1]]``.
     discarded_abs_sum : float
-        Sum of |coeffs| discarded — an upper bound on the absolute uniform
+        Sum of ``|coeffs|`` discarded — an upper bound on the absolute uniform
         error introduced by the truncation.
     """
     c = np.asarray(coeffs)
