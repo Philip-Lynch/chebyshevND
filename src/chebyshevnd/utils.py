@@ -30,7 +30,9 @@ def chebyshev_gauss_lobatto_nodes(N,a,b):
     Generate the N Chebyshev-Gauss-Lobatto (extrema) nodes on [a, b].
 
     These are the extrema of the Chebyshev polynomial T_{N-1} and include
-    the endpoints a and b. The nodes are returned in descending order.
+    the endpoints a and b. The nodes are returned in descending order;
+    sample your function at them in this order, since the coefficient
+    computation assumes it.
 
     Parameters
     ----------
@@ -56,7 +58,9 @@ def chebyshev_nodes(N,a,b):
     Generate the N Chebyshev (root) nodes on [a, b].
 
     These are the roots of the Chebyshev polynomial T_N and exclude the
-    endpoints a and b. The nodes are returned in descending order.
+    endpoints a and b. The nodes are returned in descending order;
+    sample your function at them in this order, since the coefficient
+    computation assumes it.
 
     Parameters
     ----------

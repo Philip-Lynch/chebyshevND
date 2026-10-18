@@ -24,10 +24,14 @@ class ChebyshevInterpolant2D:
             grid of the chosen node family (``chebyshev_nodes`` per axis for
             'Chebyshev', ``chebyshev_gauss_lobatto_nodes`` for 'GaussLobatto')
             with ``np.meshgrid(..., indexing='ij')`` ordering.
+            Axis 0 is x and axis 1 is y, matching the order of the bound
+            arguments; pass the bounds by keyword to avoid mixing them up.
         ax, bx : float, optional
-            Domain bounds in x. Default [-1, 1].
+            Lower and upper bounds of x (axis 0 of ``vals``).
+            Default [-1, 1].
         ay, by : float, optional
-            Domain bounds in y. Default [-1, 1].
+            Lower and upper bounds of y (axis 1 of ``vals``).
+            Default [-1, 1].
         nodes : str, optional
             Node family the values were sampled at: 'Chebyshev' (default) or
             'GaussLobatto'.
