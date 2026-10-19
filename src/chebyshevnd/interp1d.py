@@ -20,11 +20,13 @@ class ChebyshevInterpolant1D:
         Parameters
         ----------
         vals : array-like
-            Function values sampled at the nodes of [a, b]:
+            Function values sampled at the nodes of [a, b], in the order the
+            node function returns them (descending; don't sort them):
             ``chebyshev_nodes(N, a, b)`` for 'Chebyshev', or
             ``chebyshev_gauss_lobatto_nodes(N, a, b)`` for 'GaussLobatto'.
         a, b : float, optional
-            Domain bounds. Default [-1, 1].
+            Lower and upper domain bounds: the same pair used to generate the
+            nodes. Default [-1, 1].
         nodes : str, optional
             Node family the values were sampled at: 'Chebyshev' (default) or
             'GaussLobatto'.
