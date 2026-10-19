@@ -5,7 +5,7 @@ from scipy.fft import dctn
 from numba import njit
 
 
-@njit
+@njit(cache=True)
 def rescale_variable(x, a, b):
     """
     Map x from [a, b] to [-1, 1].
@@ -30,7 +30,9 @@ def chebyshev_gauss_lobatto_nodes(N,a,b):
     Generate the N Chebyshev-Gauss-Lobatto (extrema) nodes on [a, b].
 
     These are the extrema of the Chebyshev polynomial T_{N-1} and include
-    the endpoints a and b. The nodes are returned in descending order.
+    the endpoints a and b. The nodes are returned in descending order;
+    sample your function at them in this order, since the coefficient
+    computation assumes it.
 
     Parameters
     ----------
@@ -56,7 +58,9 @@ def chebyshev_nodes(N,a,b):
     Generate the N Chebyshev (root) nodes on [a, b].
 
     These are the roots of the Chebyshev polynomial T_N and exclude the
-    endpoints a and b. The nodes are returned in descending order.
+    endpoints a and b. The nodes are returned in descending order;
+    sample your function at them in this order, since the coefficient
+    computation assumes it.
 
     Parameters
     ----------
@@ -218,7 +222,7 @@ def prune_trailing_slices_greedy_nd(coeffs, delta=1e-10, scale='max'):
         Per-axis truncation counts; keep
         ``coeffs[:kmax[0], :kmax[1], ..., :kmax[n-1]]``.
     discarded_abs_sum : float
-        Sum of |coeffs| discarded — an upper bound on the absolute uniform
+        Sum of ``|coeffs|`` discarded — an upper bound on the absolute uniform
         error introduced by the truncation.
     """
     c = np.asarray(coeffs)

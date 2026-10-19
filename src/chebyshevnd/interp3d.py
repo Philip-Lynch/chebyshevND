@@ -31,12 +31,18 @@ class ChebyshevInterpolant3D:
             tensor grid of the chosen node family (``chebyshev_nodes`` per
             axis for 'Chebyshev', ``chebyshev_gauss_lobatto_nodes`` for
             'GaussLobatto') with ``np.meshgrid(..., indexing='ij')`` ordering.
+            Axis 0 is x, axis 1 is y and axis 2 is z, matching the order of
+            the bound arguments; pass the bounds by keyword to avoid mixing
+            them up.
         ax, bx : float, optional
-            Domain bounds in x. Default [-1, 1].
+            Lower and upper bounds of x (axis 0 of ``vals``).
+            Default [-1, 1].
         ay, by : float, optional
-            Domain bounds in y. Default [-1, 1].
+            Lower and upper bounds of y (axis 1 of ``vals``).
+            Default [-1, 1].
         az, bz : float, optional
-            Domain bounds in z. Default [-1, 1].
+            Lower and upper bounds of z (axis 2 of ``vals``).
+            Default [-1, 1].
         nodes : str, optional
             Node family the values were sampled at: 'Chebyshev' (default) or
             'GaussLobatto'.
@@ -55,7 +61,7 @@ class ChebyshevInterpolant3D:
         self.max = np.max([np.abs(self.coeffs)])
         self.rel_error = self.abs_error / self.max
         self.kmax = (self.Nx,self.Ny,self.Nz)
-        self.NyMaxes = np.ones(self.Nx, dtype=np.int64) * self.Nz
+        self.NyMaxes = np.ones(self.Ny, dtype=np.int64) * self.Nz
 
     def evaluate(self, x, y,z):
         """
@@ -123,7 +129,9 @@ class ChebyshevInterpolant3D:
         slices while keeping the global relative error below `rel_tol`.
 
         Sets ``self.kmax``, the per-axis truncation counts that ``evaluate()``
-        uses to shorten the Clenshaw recursions.
+        uses to shorten the Clenshaw recursions. An x axis collapsed earlier
+        by ``precompute_x`` keeps its old truncation; call ``precompute_x``
+        again to use the new one.
 
         Parameters
         ----------
@@ -131,7 +139,6 @@ class ChebyshevInterpolant3D:
             Allowed global relative error of the truncation.
         """
         self.kmax = prune_trailing_slices_greedy_nd(self.coeffs, delta=rel_tol, scale='max')[0]
-        self.NyMaxes = np.ones(self.kmax[1], dtype=np.int64) * self.kmax[2]
 
     def effective_grid(self):
         """
@@ -158,18 +165,21 @@ class ChebyshevInterpolant3D:
             The fixed x value.
         """
         tx = (2 * x_value - (self.bx + self.ax)) / (self.bx - self.ax)
+        ix, iy, iz = self.kmax
 
         # Collapse x-direction using Clenshaw recurrence for each (j, k)
-        Ny, Nz = self.Ny, self.Nz
-        temp_yz = np.empty((Ny, Nz))
+        temp_yz = np.empty((iy, iz))
 
-        for j in range(self.kmax[1]):
-            for k in range(self.kmax[2]):
+        for j in range(iy):
+            for k in range(iz):
                 # pull the 1D coeffs in x for this (j, k)
-                coeffs_x = self.coeffs[:, j, k]
+                coeffs_x = self.coeffs[:ix, j, k]
                 temp_yz[j, k] = clenshaw_1d(coeffs_x, tx)
 
         self.precomp_x = temp_yz
+        # Truncation used by evaluate_yz, tied to the block filled above so a
+        # later optimize() cannot make it read entries that were never set
+        self.NyMaxes = np.ones(iy, dtype=np.int64) * iz
 
     def evaluate_yz(self, y, z):
         """

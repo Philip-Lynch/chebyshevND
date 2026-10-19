@@ -11,8 +11,8 @@ authors:
     affiliation: "Max Planck Institute for Gravitational Physics (Albert Einstein Institute)"
 repository-code: "https://github.com/Philip-Lynch/chebyshevND"
 license: MIT
-version: 0.1.0
-doi: "10.5281/zenodo.21825113"
+version: 0.1.1
+doi: "10.5281/zenodo.21825112"
 preferred-citation:
   type: article
   title: "Systematic errors in fast relativistic waveforms for Extreme Mass Ratio Inspirals"
