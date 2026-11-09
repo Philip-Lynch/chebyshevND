@@ -29,7 +29,7 @@ class ChebyshevInterpolantND:
         Parameters
         ----------
         vals : array-like
-            Function values of shape (N_1, ..., N_d), sampled on the tensor
+            Real or complex function values of shape (N_1, ..., N_d), sampled on the tensor
             grid of the chosen node family (``chebyshev_nodes`` per axis for
             'Chebyshev', ``chebyshev_gauss_lobatto_nodes`` for 'GaussLobatto')
             with ``np.meshgrid(..., indexing='ij')`` ordering, so that axis k
@@ -47,9 +47,9 @@ class ChebyshevInterpolantND:
             ``("x0", "x1", ...)``.
         """
         vals = np.asarray(vals)
-        if np.iscomplexobj(vals):
-            raise TypeError("Complex values are not supported yet.")
-        vals = vals.astype(np.float64, copy=False)
+        # Two dtypes only (design doc A4): complex input stays complex
+        dtype = np.complex128 if np.iscomplexobj(vals) else np.float64
+        vals = vals.astype(dtype, copy=False)
 
         a, b = _parse_domains(domains)
         d = a.shape[0]
@@ -128,6 +128,11 @@ class ChebyshevInterpolantND:
         return self._axis_names
 
     @property
+    def dtype(self):
+        """Coefficient dtype: float64, or complex128 for complex values."""
+        return self._coeffs.dtype
+
+    @property
     def nodes(self):
         """Node family the values were sampled at."""
         return self._nodes
@@ -145,8 +150,9 @@ class ChebyshevInterpolantND:
 
         Returns
         -------
-        float
-            Value of the interpolant at the point.
+        float or complex
+            Value of the interpolant at the point (complex for complex
+            values).
         """
         x = self._point(xs)
         evaluate_point(self._flat, self._shape, self._a, self._b, x, self._ts,
@@ -277,7 +283,7 @@ class ChebyshevInterpolantND:
     def __repr__(self):
         return (
             f"ChebyshevInterpolantND(axes={self._axis_names}, grid_shape={self._grid_shape}, "
-            f"kmax={self._kmax}, nodes={self._nodes!r})"
+            f"kmax={self._kmax}, nodes={self._nodes!r}, dtype={self.dtype})"
         )
 
 

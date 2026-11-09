@@ -150,3 +150,12 @@ def test_partial_clenshaw_4d_respects_x_truncation(rng):
         full = clenshaw_4d(coeffs, x, *point, kmax=kmax)
         partial = clenshaw_3d(collapsed, *point)
         assert partial == pytest.approx(full, rel=1e-12, abs=1e-14)
+
+
+def test_clenshaw_nd_complex_coefficients(rng):
+    shape = (4, 5, 3, 4)
+    coeffs = decaying_coeffs(rng, shape) + 1j * decaying_coeffs(rng, shape)
+    ts = rng.uniform(-1.0, 1.0, size=4)
+    got = clenshaw_nd(coeffs, ts)
+    assert type(got) is complex
+    assert got == pytest.approx(direct_eval(coeffs, ts), rel=1e-12, abs=1e-14)

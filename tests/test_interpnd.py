@@ -215,3 +215,58 @@ def test_evaluate_argument_checks():
         nd.evaluate(0.5, 0.5)
     with pytest.raises(TypeError):
         nd.evaluate(np.array([0.5, 0.6]), 0.5, 2.0)
+
+
+# -------------------------------------------------------------------- complex
+
+COMPLEX_CASES = {
+    3: (lambda x, y, z: np.exp(1j * x) * np.cos(y) * z,
+        [(0.0, 2.0), (-1.0, 1.0), (0.5, 1.5)], (22, 18, 3)),
+    4: (lambda x, y, z, w: np.exp(1j * (x + 0.5 * w)) * np.cos(y) * (1 + z**2),
+        [(0.0, 2.0), (-1.0, 1.0), (0.0, 1.0), (-1.0, 0.0)], (22, 18, 4, 16)),
+    5: (lambda x, y, z, w, v: np.exp(1j * x) * np.sin(y + 1) * z * np.exp(-1j * w) * (1 + v),
+        [(0.0, 1.0), (-1.0, 0.0), (1.0, 2.0), (0.0, 1.0), (-0.5, 0.5)], (17, 16, 2, 17, 2)),
+}
+
+
+@pytest.mark.parametrize("nodes", ["Chebyshev", "GaussLobatto"])
+@pytest.mark.parametrize("dim", [3, 4, 5])
+def test_complex_functions(dim, nodes):
+    f, domains, Ns = COMPLEX_CASES[dim]
+    _, vals = sample_on_grid(f, domains, Ns, nodes=nodes)
+    nd = ChebyshevInterpolantND(vals, domains, nodes=nodes)
+    assert nd.dtype == np.complex128
+    for p in random_points(domains, 20):
+        got = nd.evaluate(*p)
+        assert type(got) is complex
+        assert abs(got - f(*p)) < 1e-14
+
+
+def test_complex_equals_real_and_imaginary_parts():
+    f, domains, Ns = COMPLEX_CASES[4]
+    _, vals = sample_on_grid(f, domains, Ns)
+    nd = ChebyshevInterpolantND(vals, domains)
+    re = ChebyshevInterpolantND(vals.real, domains)
+    im = ChebyshevInterpolantND(vals.imag, domains)
+    for p in random_points(domains, 10):
+        assert nd.evaluate(*p) == pytest.approx(complex(re.evaluate(*p), im.evaluate(*p)), abs=1e-15)
+
+
+def test_complex_optimize_bound_holds():
+    f, domains, Ns = COMPLEX_CASES[4]
+    _, vals = sample_on_grid(f, domains, Ns)
+    nd = ChebyshevInterpolantND(vals, domains)
+    points = random_points(domains, 30)
+    before = np.array([nd.evaluate(*p) for p in points])
+    scale = np.abs(nd.get_coefficients(full=True)).max()
+    nd.optimize(1e-7)
+    assert nd.kmax < nd.grid_shape
+    after = np.array([nd.evaluate(*p) for p in points])
+    assert np.max(np.abs(after - before)) <= 1e-7 * scale
+
+
+def test_real_input_stays_real():
+    _, _, _, _, nd = build(2)
+    assert nd.dtype == np.float64
+    integer_vals = ChebyshevInterpolantND(np.arange(12).reshape(3, 4), [(0, 1), (0, 1)])
+    assert integer_vals.dtype == np.float64
