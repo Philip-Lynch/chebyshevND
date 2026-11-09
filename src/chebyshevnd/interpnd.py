@@ -11,7 +11,13 @@ from .batched import evaluate_batch as _evaluate_batch
 from .derivatives import differentiate_coefficients
 from .errors import OutOfDomainError, describe_out_of_domain
 from .kernels import evaluate_point
-from .utils import compute_chebyshev_coefficients_nd, prune_trailing_slices_greedy_nd
+from .utils import (
+    chebyshev_gauss_lobatto_nodes,
+    chebyshev_nodes,
+    chebyshev_values_at_nodes_nd,
+    compute_chebyshev_coefficients_nd,
+    prune_trailing_slices_greedy_nd,
+)
 
 _NODE_FAMILIES = ("Chebyshev", "GaussLobatto")
 
@@ -646,6 +652,54 @@ class ChebyshevInterpolantND:
             abs_error=interp_error + truncation + rounding,
             grid_shape=self._grid_shape,
         )
+
+    def values_at_nodes(self):
+        """
+        Values of the full series on the interpolant's own node grid.
+
+        For an interpolant built from samples, this reproduces the samples
+        (to rounding). For a derivative, it gives the derivative's values
+        at the nodes where the original function was sampled. That is the
+        build workflow for higher-order tables: fit F0, take
+        ``F0.derivative(...).values_at_nodes()``, combine with other values
+        at the same nodes (see :meth:`axis_nodes`), and fit the result.
+
+        Uses the full (untruncated) series and one inverse DCT.
+
+        Returns
+        -------
+        np.ndarray
+            Shape ``grid_shape`` for a single function, ``grid_shape + (F,)``
+            with a function axis, ordered like ``np.meshgrid(*axis_nodes(),
+            indexing='ij')``.
+
+        Raises
+        ------
+        RuntimeError
+            If the full tensor was dropped by ``optimize(keep_full=False)``.
+        """
+        if self._coeffs_full is None:
+            raise RuntimeError(
+                "values_at_nodes() needs the full coefficient tensor, which was dropped by "
+                "optimize(keep_full=False)."
+            )
+        vals = chebyshev_values_at_nodes_nd(self._coeffs_full, nodes=self._nodes, axes=range(self.ndim))
+        return vals[..., 0] if self._single else vals
+
+    def axis_nodes(self):
+        """
+        The node coordinates along each axis.
+
+        Returns
+        -------
+        tuple of np.ndarray
+            For each axis, its ``grid_shape`` nodes in the order the node
+            functions return them (descending), so that
+            ``np.meshgrid(*interp.axis_nodes(), indexing='ij')`` is the
+            sampling grid.
+        """
+        node_fn = chebyshev_nodes if self._nodes == "Chebyshev" else chebyshev_gauss_lobatto_nodes
+        return tuple(node_fn(n, a, b) for n, a, b in zip(self._grid_shape, self._a, self._b))
 
     def _differentiate(self, coeffs, orders):
         """Differentiate a coefficient tensor (trailing output axis included) by `orders`."""

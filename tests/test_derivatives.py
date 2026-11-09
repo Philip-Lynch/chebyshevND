@@ -196,3 +196,64 @@ def test_metadata_is_kept():
 def test_bad_orders(orders, error):
     with pytest.raises(error):
         build().derivative(orders)
+
+
+# ------------------------------------------------------------ values at nodes
+
+@pytest.mark.parametrize("nodes", ["Chebyshev", "GaussLobatto"])
+def test_values_at_nodes_reproduce_samples(nodes):
+    _, vals = sample_on_grid(f, DOMAINS, (9, 7, 8), nodes=nodes)
+    nd = ChebyshevInterpolantND(vals, DOMAINS, nodes=nodes)
+    np.testing.assert_allclose(nd.values_at_nodes(), vals, rtol=1e-13, atol=1e-14)
+    nd.optimize(1e-4)  # truncation does not affect the full series
+    np.testing.assert_allclose(nd.values_at_nodes(), vals, rtol=1e-13, atol=1e-14)
+
+
+def test_values_at_nodes_multi_output_complex():
+    axes = sample_on_grid(lambda *x: x[0], DOMAINS, (6, 5, 4))[0]
+    grids = np.meshgrid(*axes, indexing="ij")
+    vals = np.stack([np.exp(1j * grids[0]) * grids[2], grids[1] ** 2 + 0j], axis=-1)
+    nd = ChebyshevInterpolantND(vals, DOMAINS, output_names=["a", "b"])
+    np.testing.assert_allclose(nd.values_at_nodes(), vals, rtol=1e-13, atol=1e-14)
+
+
+@pytest.mark.parametrize("nodes", ["Chebyshev", "GaussLobatto"])
+def test_axis_nodes_are_the_sampling_grid(nodes):
+    axes, _ = sample_on_grid(f, DOMAINS, NS, nodes=nodes)
+    nd = build(nodes)
+    for got, expected in zip(nd.axis_nodes(), axes):
+        np.testing.assert_allclose(got, expected, rtol=1e-15)
+
+
+@pytest.mark.parametrize("orders", [(1, 0, 0), (0, 1, 1), (0, 0, 2)], ids=str)
+def test_derivative_values_at_nodes(orders):
+    nd = build()
+    grids = np.meshgrid(*nd.axis_nodes(), indexing="ij")
+    tol = 1e-10 if sum(orders) == 1 else 1e-8
+    np.testing.assert_allclose(nd.derivative(orders).values_at_nodes(), EXACT[orders](*grids), atol=tol)
+
+
+def test_values_at_nodes_of_precontraction():
+    nd = build()
+    child = nd.precontract({"x": 0.4})
+    y, z = np.meshgrid(*child.axis_nodes(), indexing="ij")
+    np.testing.assert_allclose(child.values_at_nodes(), f(0.4, y, z), atol=1e-13)
+
+
+def test_values_at_nodes_needs_full_tensor():
+    nd = build()
+    nd.optimize(1e-8, keep_full=False)
+    with pytest.raises(RuntimeError):
+        nd.values_at_nodes()
+
+
+def test_build_workflow_for_a_higher_order_table():
+    # The NIT pattern: a table built from derivatives of another table at its
+    # own nodes. Here F1 = dF0/dy * g on the same grid, with dF0/dy known.
+    f0 = build()
+    grids = np.meshgrid(*f0.axis_nodes(), indexing="ij")
+    g = 1.0 + grids[0] * grids[2]
+    f1_vals = f0.derivative({"y": 1}).values_at_nodes() * g
+    f1 = ChebyshevInterpolantND(f1_vals, DOMAINS, axis_names=NAMES)
+    for p in random_points(20):
+        assert f1.evaluate(*p) == pytest.approx(EXACT[(0, 1, 0)](*p) * (1 + p[0] * p[2]), abs=1e-10)
