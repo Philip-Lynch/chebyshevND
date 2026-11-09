@@ -257,3 +257,46 @@ def test_build_workflow_for_a_higher_order_table():
     f1 = ChebyshevInterpolantND(f1_vals, DOMAINS, axis_names=NAMES)
     for p in random_points(20):
         assert f1.evaluate(*p) == pytest.approx(EXACT[(0, 1, 0)](*p) * (1 + p[0] * p[2]), abs=1e-10)
+
+
+# --------------------------------------------------------- finite-difference check
+
+@pytest.mark.parametrize("orders", list(EXACT), ids=str)
+def test_check_derivatives_agrees(orders):
+    nd = build()
+    tol = 1e-8 if sum(orders) == 1 else 1e-5
+    assert nd.check_derivatives(orders, random_points(20)) < tol
+
+
+def test_check_derivatives_at_the_boundary():
+    nd = build()
+    lo, hi = np.array(DOMAINS).T
+    assert nd.check_derivatives({"x": 1}, np.array([lo, hi])) < 1e-8
+
+
+def test_check_derivatives_detects_a_wrong_derivative(monkeypatch):
+    nd = build()
+    other = ChebyshevInterpolantND(sample_on_grid(lambda x, y, z: x * y * z, DOMAINS, NS)[1], DOMAINS,
+                                   axis_names=NAMES)
+    monkeypatch.setattr(nd, "derivative", lambda orders: other.derivative(orders))
+    assert nd.check_derivatives({"x": 1}, random_points(10)) > 0.1
+
+
+def test_check_derivatives_multi_output():
+    axes = sample_on_grid(lambda *x: x[0], DOMAINS, (14, 12, 10))[0]
+    grids = np.meshgrid(*axes, indexing="ij")
+    vals = np.stack([f(*grids), np.exp(1j * grids[0]) * grids[1]], axis=-1)
+    nd = ChebyshevInterpolantND(vals, DOMAINS, output_names=["a", "b"])
+    result = nd.check_derivatives((1, 1, 0), random_points(10))
+    assert result.shape == (2,) and np.all(result < 1e-5)
+
+
+@pytest.mark.parametrize("orders", [(0, 0, 0), (1, 1, 1), (3, 0, 0)])
+def test_check_derivatives_rejects_unsupported_orders(orders):
+    with pytest.raises(ValueError, match="first and second"):
+        build().check_derivatives(orders, random_points(2))
+
+
+def test_check_derivatives_point_shape():
+    with pytest.raises(ValueError, match=r"shape \(n, 3\)"):
+        build().check_derivatives({"x": 1}, np.zeros((2, 2)))

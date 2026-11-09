@@ -653,6 +653,75 @@ class ChebyshevInterpolantND:
             grid_shape=self._grid_shape,
         )
 
+    def check_derivatives(self, orders, points, step=None):
+        """
+        Compare an analytic derivative with finite differences of this interpolant.
+
+        A routine sanity check for grid builds: the analytic derivative from
+        :meth:`derivative` should agree with central finite differences of
+        this interpolant, to the accuracy finite differences allow.
+
+        Parameters
+        ----------
+        orders : sequence of int or mapping
+            As for :meth:`derivative`. First derivatives, pure second
+            derivatives and mixed second derivatives are supported.
+        points : array-like, shape (n, d)
+            Points inside the domain at which to compare.
+        step : float, optional
+            Finite-difference step as a fraction of each axis's width.
+            Defaults to 1e-5 for first and 1e-4 for second derivatives,
+            near the optimum for float64.
+
+        Returns
+        -------
+        float or np.ndarray
+            ``max |analytic - finite difference| / max |analytic|`` over the
+            points (absolute if the derivative vanishes there), per function.
+            For a well-resolved table, expect around 1e-10 for first and 1e-8
+            for second derivatives (the limit of the finite differences);
+            much larger values indicate a problem.
+        """
+        orders = self._parse_orders(orders)
+        if sum(orders) not in (1, 2):
+            raise ValueError("check_derivatives() supports first and second derivatives only.")
+        pts = np.atleast_2d(np.asarray(points, dtype=np.float64))
+        if pts.shape[1] != self.ndim:
+            raise ValueError(f"points must have shape (n, {self.ndim}); got {pts.shape}.")
+        if step is None:
+            step = 1e-5 if sum(orders) == 1 else 1e-4
+        h = step * (self._b - self._a)
+
+        axes = [ax for ax, o in enumerate(orders) for _ in range(o)]
+        if len(axes) == 1 or axes[0] != axes[1]:
+            # Product of central differences, one per axis
+            stencil = [(1.0, [])]
+            for ax in axes:
+                stencil = [(w * s, shifts + [(ax, s)]) for w, shifts in stencil for s in (1.0, -1.0)]
+            denominator = np.prod([2.0 * h[ax] for ax in axes])
+        else:
+            ax = axes[0]
+            stencil = [(1.0, [(ax, 1.0)]), (-2.0, []), (1.0, [(ax, -1.0)])]
+            denominator = h[ax] ** 2
+
+        shifted = []
+        for _, shifts in stencil:
+            p = pts.copy()
+            for ax, s in shifts:
+                p[:, ax] += s * h[ax]
+            shifted.append(p)
+        # Evaluate without the domain check: stencils may step just outside
+        values, _ = _evaluate_batch(self._coeffs, self._a, self._b, np.concatenate(shifted), tol=np.inf)
+        values = values.reshape(len(stencil), len(pts), -1)
+        finite_diff = sum(w * v for (w, _), v in zip(stencil, values)) / denominator
+
+        analytic = self.derivative(orders).evaluate_batch(pts)
+        analytic = analytic.reshape(len(pts), -1)
+        scale = np.abs(analytic).max(axis=0)
+        scale = np.where(scale > 0, scale, 1.0)
+        discrepancy = np.abs(analytic - finite_diff).max(axis=0) / scale
+        return float(discrepancy[0]) if self._single else discrepancy
+
     def values_at_nodes(self):
         """
         Values of the full series on the interpolant's own node grid.
