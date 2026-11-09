@@ -1,13 +1,15 @@
 # ChebyshevND — design document for the NIT / SEOBNRv6EPHM extension
 
-**Revision:** 3 (2026-11-09).
+**Revision:** 3.1 (2026-11-09).
+- Step 1 is implemented and merged into `dev`; §3 records what was built
+  and where it differs from the plan.
 - GPU support with CUDA via CuPy is now a requirement (§0.3, A8, D6).
 - The second consumer is an interpolated post-Minkowskian (PM) Hamiltonian
   (§0.2).
 - Step 0 is complete (v0.1.1).
 - §9 lists all revisions and maps the old step numbers to the new ones.
 
-**Branch:** `dev`, at v0.1.1 plus the citation fix.
+**Branch:** `dev` (v0.1.1 plus Step 1).
 
 **Purpose:** turn ChebyshevND from a 1D–4D single-function interpolator into the
 tabulation-and-evaluation backend for:
@@ -272,10 +274,12 @@ array namespace `xp`, chosen from the arrays passed in (NumPy or CuPy).
   `points`. They are either **shared** (`(k₁, …, k_d[, F])`) or **per member**
   (a leading batch axis `B`, produced by Step 2b).
 - **Basis values:** the three-term recurrence, vectorised over the batch.
-  - In CuPy, a Python loop over `k` would launch one kernel per `k`.
-    Instead, all axes' bases are computed in a single `cupy.RawKernel`. This
-    is CUDA C compiled at run time by NVRTC, so packaging needs no CUDA build
-    step.
+  - As implemented in Step 1e, this is a Python loop over `k` of array
+    operations, so on CuPy it launches one kernel per `k`.
+  - Computing all axes' bases in a single `cupy.RawKernel` (CUDA C compiled
+    at run time by NVRTC, so no CUDA build step) is deferred to Step 4b. It
+    could not be compiled or tested without a CUDA machine, and GPU
+    benchmarks should justify it first.
   - `cos(k·arccos t)` is not used: it loses about half the digits near
     `t = ±1`.
 - **Contractions:**
@@ -317,7 +321,11 @@ contains:
 - CI on `dev`;
 - the ordering documentation (issue #1).
 
-### Step 1 — Core nD engine (`ChebyshevInterpolantND`)
+### Step 1 — Core nD engine (`ChebyshevInterpolantND`) — IMPLEMENTED
+
+Implemented on branch `step1-nd-core` with one commit per sub-step, and
+merged into `dev` on 2026-11-09. "As built" below records where it differs
+from the design.
 
 **Why first:** 5D is needed, and the right fix is not an `interp5d.py`. One
 nD class gives every later feature a single home instead of four copies. It
@@ -326,9 +334,8 @@ and batches, instead of rewriting it several times.
 
 **Design:**
 - `ChebyshevInterpolantND(vals, domains, nodes='Chebyshev', axis_names=None,
-  output_names=None)`. `domains` is a list of `(a, b)` pairs. If
-  `vals.ndim == len(domains) + 1`, the trailing axis is the function axis.
-  Values only; no callables (consistent with v0.1).
+  output_names=None, domain_tol=1e-12)`. `domains` is a list of `(a, b)`
+  pairs. Values only; no callables (consistent with v0.1).
 - Coefficients from the existing DCT path, restricted to the spatial axes
   (`compute_chebyshev_coefficients_nd` and both renormalisers gain an `axes`
   argument).
@@ -350,6 +357,45 @@ and batches, instead of rewriting it several times.
 - Box-domain check: the kernels set `status ≠ 0` when any `|t| > 1 + tol`.
   `evaluate` raises `OutOfDomainError(ValueError)`. The tolerance is
   configurable; boundary points must pass.
+
+**As built** (differences from the design above):
+- **The function axis is opt-in.** Passing `output_names` declares the
+  trailing function axis. Without it, `vals` must have exactly one axis per
+  domain. Inferring the axis from `vals.ndim == len(domains) + 1` would have
+  silently turned a missing domain into a function axis.
+- **Bounds are checked:** each `(a, b)` must have `a < b`, finite.
+- **Kernels** (`kernels.py`):
+  - `contract(coeffs, shape, ts, basis, work_a, work_b, out)`;
+  - `evaluate_point(coeffs, shape, bounds, xs, tol, scratch, work, out) -> status`,
+    with `bounds` of shape `(2, d)` and `work` of shape `(2, n)`. It takes
+    8 arguments, because Numba's per-argument dispatch cost dominated small
+    tables.
+  - The two work buffers must stay separate arrays: halves of one array
+    stopped the inner loop from vectorising (12⁴: 12.3 → 20.7 µs).
+- **`absolute_error()`** is the trailing-coefficient estimate plus the
+  coefficient magnitudes discarded by `optimize`, so it covers truncation.
+- **Batches:**
+  - `evaluate_batch` processes shared-table batches in chunks under a
+    256 MB memory budget, since the intermediate after the first GEMM has
+    B × (table size / k₁) entries.
+  - The first CuPy call copies the table to the device and caches it;
+    `optimize` clears the cache.
+- **Measured** (per call, Apple laptop; v0.1 class in brackets):
+
+  | Grid | `evaluate` | Batched, per point (B = 1000) |
+  |---|---|---|
+  | 1D (64) | 1.34 µs (2.03) | 0.29 µs |
+  | 2D (32×24) | 1.63 µs (1.36) | 0.32 µs |
+  | 3D (20×16×12) | 3.29 µs (3.28) | 0.55 µs |
+  | 4D (12⁴) | 12.3 µs (15.0) | 1.6 µs |
+  | 5D (12×10×8×8×6) | 26 µs | 5.6 µs |
+
+  `clenshaw_nd` takes 20 µs on 12⁴, down from ~34 ms. The 2D gap is fixed
+  Python-level overhead, which Step 4a's compiled entry point avoids.
+  Step 8 must benchmark the 2D/3D wrappers before replacing the v0.1
+  classes (D5).
+- **GPU tests** (`pytest -m gpu`) are written but have not yet been run on a
+  CUDA machine.
 
 Sub-steps, each with its own tests:
 - **1a** real, single output (kernel + class);
@@ -765,10 +811,10 @@ These change details of 1e, 2b and 4b, not the plan's structure.
 | Step | New / modified |
 |---|---|
 | 0 (done) | `interp3d.py`, `interp4d.py`, `clenshaw.py`, `utils.py`, `.github/workflows/tests.yml`, `benchmarks/`, README, docs, examples |
-| 1 | new `kernels.py` (Numba contraction kernel), new `interpnd.py`, new `batched.py` (the A8 evaluator), new `backend.py` (array-namespace detection, `to_device`, optional CuPy import), new `cuda_kernels.py` (RawKernel sources), `clenshaw.py` (`clenshaw_nd` delegates), `utils.py` (`axes=` for coefficients, per-function pruning), `__init__.py`, `tests/helpers.py`, `pyproject.toml` (`gpu` extra, `gpu` pytest marker) |
+| 1 (done) | new `kernels.py`, `interpnd.py`, `batched.py`, `backend.py`; `clenshaw.py` (`clenshaw_nd` on the kernel); `utils.py` (`axes=`); `__init__.py`; `docs/api.rst`; `benchmarks/bench_evaluate.py`; `pyproject.toml` (`gpu` extra and marker); tests `test_interpnd.py`, `test_batched.py`, `helpers.py` |
 | 2 | `interpnd.py` (`precontract`), `batched.py` (batched precontraction) |
 | 3 | new `derivatives.py`, `utils.py` (inverse DCT), `interpnd.py` (`derivative`, `values_at_nodes`, `check_derivatives`) |
-| 4 | `kernels.py` (`eval_into`, `eval_grad_into`), `batched.py` (`value_and_grad_batch`), `cuda_kernels.py`, `interpnd.py` (`raw`, `value_and_grad`) |
+| 4 | `kernels.py` (`eval_into`, `eval_grad_into`), `batched.py` (`value_and_grad_batch`), new `cuda_kernels.py` (RawKernel sources, moved from Step 1), `interpnd.py` (`raw`, `value_and_grad`) |
 | 5 | 5a: new `maps.py` (Numba and `xp` versions, `eval_grad_physical_into`, `value_and_grad_physical_batch`), `interpnd.py` (`evaluate_physical`); 5b: new `grid.py` |
 | 6 | new `io.py` (with device placement), `pyproject.toml` (`io` extra) |
 | 7 | new `prefactors.py` |
@@ -777,6 +823,16 @@ These change details of 1e, 2b and 4b, not the plan's structure.
 ---
 
 ## 9. Revision history
+
+**Revision 3.1 (2026-11-09).** Step 1 implemented and merged into `dev`.
+Step 1 now records how it was built and where it differs from the plan:
+- the function axis is opt-in via `output_names`;
+- kernel signatures and the reason the work buffers stay separate;
+- `absolute_error` includes truncation;
+- batch chunking and device caching;
+- measured timings.
+
+The RawKernel for the Chebyshev values moved from 1e to 4b (A8, §8).
 
 **Revision 3 (2026-11-09).** GPU support and the PM Hamiltonian.
 - pySEOBNR's GPU port uses CUDA via CuPy, so batched GPU evaluation is now a
