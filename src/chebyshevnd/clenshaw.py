@@ -274,4 +274,4 @@ def clenshaw_nd(coeffs, xs, a=None, b=None, kmax=None):
     out = np.empty(1, dtype=dtype)
     contract(flat, shape, ts, np.empty(shape.max()), np.empty(rest, dtype=dtype),
              np.empty(rest, dtype=dtype), out)
-    return out[0].item()
+    return out.item(0)

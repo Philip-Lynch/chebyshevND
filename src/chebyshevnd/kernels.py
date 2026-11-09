@@ -44,7 +44,9 @@ def contract(coeffs, shape, ts, basis, work_a, work_b, out):
         Scratch space of length >= max(shape).
     work_a, work_b : 1D arrays
         Scratch space, same dtype as ``coeffs``, each of length
-        >= k_2 * ... * k_d * F.
+        >= k_2 * ... * k_d * F. They alternate as source and destination of
+        successive contractions; keeping them as separate arrays (rather than
+        halves of one) lets the compiler vectorise the inner loop.
     out : 1D array
         Receives the F output values; same dtype as ``coeffs``.
     """
@@ -70,12 +72,26 @@ def contract(coeffs, shape, ts, basis, work_a, work_b, out):
 
 
 @njit(cache=True)
-def evaluate_point(coeffs, shape, a, b, xs, tol, ts, basis, work_a, work_b, out):
+def evaluate_point(coeffs, shape, bounds, xs, tol, scratch, work, out):
     """
-    Map ``xs`` from the box [a, b] to [-1, 1]^d and evaluate the table there.
+    Map ``xs`` from its box to [-1, 1]^d and evaluate the table there.
 
-    ``ts`` is scratch space of length d; the other arguments are as for
-    :func:`contract`.
+    Parameters
+    ----------
+    coeffs, shape, out
+        As for :func:`contract`.
+    work : 2D array, shape (2, k_2 * ... * k_d * F)
+        Scratch space, same dtype as ``coeffs``; its rows are
+        :func:`contract`'s two work buffers.
+    bounds : 2D float64 array, shape (2, d)
+        Lower bounds in row 0, upper bounds in row 1.
+    xs : 1D float64 array
+        The point, one coordinate per axis.
+    tol : float
+        Allowed overshoot outside the domain, as a fraction of each axis's
+        half-width.
+    scratch : 1D float64 array
+        Scratch space of length >= d + max(shape).
 
     Returns
     -------
@@ -87,11 +103,14 @@ def evaluate_point(coeffs, shape, a, b, xs, tol, ts, basis, work_a, work_b, out)
         caller to act on the status.
     """
     d = shape.shape[0]
+    ts = scratch[:d]
     status = 0
     for i in range(d):
-        t = (2.0 * xs[i] - a[i] - b[i]) / (b[i] - a[i])
+        a = bounds[0, i]
+        b = bounds[1, i]
+        t = (2.0 * xs[i] - a - b) / (b - a)
         if not abs(t) <= 1.0 + tol:
             status |= 1 << i
         ts[i] = t
-    contract(coeffs, shape, ts, basis, work_a, work_b, out)
+    contract(coeffs, shape, ts, scratch[d:], work[0], work[1], out)
     return status

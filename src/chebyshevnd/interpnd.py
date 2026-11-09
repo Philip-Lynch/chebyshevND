@@ -109,6 +109,7 @@ class ChebyshevInterpolantND:
             raise ValueError(f"domain_tol must be non-negative, got {domain_tol}.")
         self._domain_tol = domain_tol
         self._a, self._b = a, b
+        self._bounds = np.stack([a, b])
         self._nodes = nodes
         self._axis_names = _parse_names(axis_names, d, "x", "axis_names")
         self._grid_shape = tuple(int(n) for n in grid_shape)
@@ -128,7 +129,7 @@ class ChebyshevInterpolantND:
         self._scale = abs_c.reshape(-1, n_out).max(axis=0)
         self._interp_error = _trailing_error_estimate(abs_c)
         self._discarded = np.zeros(n_out)
-        self._ts = np.empty(d)
+        self._x = np.empty(d)
         self._set_truncation(self._grid_shape)
 
     # ------------------------------------------------------------------ setup
@@ -142,9 +143,8 @@ class ChebyshevInterpolantND:
         self._shape = np.array(self._kmax, dtype=np.int64)
         rest = self._flat.shape[0] // self._kmax[0]
         dtype = self._coeffs.dtype
-        self._basis = np.empty(max(self._kmax))
-        self._work_a = np.empty(rest, dtype=dtype)
-        self._work_b = np.empty(rest, dtype=dtype)
+        self._scratch = np.empty(len(self._kmax) + max(self._kmax))
+        self._work = np.empty((2, rest), dtype=dtype)
         self._out = np.empty(self._coeffs.shape[-1], dtype=dtype)
         # Copies of the table on other devices, made on first use
         self._device_tables = {}
@@ -230,8 +230,8 @@ class ChebyshevInterpolantND:
             or is NaN.
         """
         x = self._point(xs)
-        status = evaluate_point(self._flat, self._shape, self._a, self._b, x, self._domain_tol,
-                                self._ts, self._basis, self._work_a, self._work_b, self._out)
+        status = evaluate_point(self._flat, self._shape, self._bounds, x, self._domain_tol,
+                                self._scratch, self._work, self._out)
         if status:
             raise OutOfDomainError(
                 "Point outside the interpolation domain: " + self._domain_message(x, status) + "."
@@ -313,21 +313,19 @@ class ChebyshevInterpolantND:
 
     def _result(self, out):
         """Return the scalar for a single function, otherwise a copy of the array."""
-        return out[0].item() if self._single else out.copy()
+        return out.item(0) if self._single else out.copy()
 
     def _point(self, xs):
-        """Validate scalar coordinates and return them as a float64 array."""
+        """Validate scalar coordinates and copy them into the instance's point buffer."""
         if len(xs) != self.ndim:
             raise TypeError(
                 f"evaluate() takes {self.ndim} coordinates {self._axis_names}, got {len(xs)}."
             )
         try:
-            x = np.array(xs, dtype=np.float64)
+            self._x[:] = xs
         except (TypeError, ValueError):
-            x = None
-        if x is None or x.ndim != 1:
-            raise TypeError("evaluate() takes one scalar per axis.")
-        return x
+            raise TypeError("evaluate() takes one scalar per axis.") from None
+        return self._x
 
     # ----------------------------------------------------- coefficients, errors
 
