@@ -1,8 +1,11 @@
 """n-dimensional Chebyshev interpolation."""
 
+import numbers
+
 import numpy as np
 
 from .backend import array_namespace, to_numpy
+from .batched import chebyshev_basis_batch
 from .batched import evaluate_batch as _evaluate_batch
 from .errors import OutOfDomainError, describe_out_of_domain
 from .kernels import evaluate_point
@@ -356,6 +359,97 @@ class ChebyshevInterpolantND:
             raise TypeError("evaluate() takes one scalar per axis.") from None
         return self._x
 
+    # --------------------------------------------------------- precontraction
+
+    def precontract(self, fixed):
+        """
+        Fix some axes at given values and return the interpolant over the others.
+
+        This is the main speed-up when some variables stay constant over many
+        evaluations (e.g. the mass ratio and spins of one waveform): the
+        fixed axes are contracted once, and every later evaluation only
+        works on the much smaller remaining tensor.
+
+        Parameters
+        ----------
+        fixed : mapping
+            Axis name (or index) -> value, e.g. ``{"nu": 0.2, "chi1": 0.5}``.
+            At least one axis must remain.
+
+        Returns
+        -------
+        ChebyshevInterpolantND
+            An interpolant over the remaining axes, in their original order,
+            with the same outputs, dtype and ``domain_tol``. It evaluates
+            exactly like this interpolant with the fixed values inserted,
+            including any truncation from :meth:`optimize`. If the full
+            coefficient tensor is still held, it is precontracted too, so
+            the result can be optimized again on its own. Its error
+            estimate starts from this interpolant's, which still bounds it.
+
+        Raises
+        ------
+        OutOfDomainError
+            If a fixed value lies outside its axis's domain.
+        """
+        axes, values = self._resolve_fixed(fixed)
+        for value in values:
+            if np.ndim(value) != 0:
+                raise TypeError(
+                    "precontract() takes one value per fixed axis; use precontract_batch() for arrays."
+                )
+        x = np.full(self.ndim, np.nan)
+        x[axes] = np.array(values, dtype=np.float64)
+        ts = (2.0 * x[axes] - self._a[axes] - self._b[axes]) / (self._b[axes] - self._a[axes])
+        bad = ~(np.abs(ts) <= 1.0 + self._domain_tol)
+        if bad.any():
+            status = sum(1 << ax for ax, flag in zip(axes, bad) if flag)
+            raise OutOfDomainError(
+                "Fixed value outside the interpolation domain: " + self._domain_message(x, status) + "."
+            )
+
+        live = [i for i in range(self.ndim) if i not in axes]
+        full = None if self._coeffs_full is None else _contract_fixed(self._coeffs_full, axes, ts)
+        return ChebyshevInterpolantND._from_tables(
+            _contract_fixed(self._coeffs, axes, ts), full, self._a[live], self._b[live],
+            nodes=self._nodes,
+            axis_names=[self._axis_names[i] for i in live],
+            output_names=self._output_names,
+            domain_tol=self._domain_tol,
+            abs_error=self._interp_error + self._discarded,
+            grid_shape=[self._grid_shape[i] for i in live],
+        )
+
+    def _resolve_fixed(self, fixed):
+        """Turn a mapping of axis name/index -> value into (axis indices, values)."""
+        if not hasattr(fixed, "items"):
+            raise TypeError("fixed must be a mapping from axis name (or index) to value.")
+        axes, values = [], []
+        for key, value in fixed.items():
+            ax = self._axis_position(key)
+            if ax in axes:
+                raise ValueError(f"Axis {self._axis_names[ax]!r} is fixed more than once.")
+            axes.append(ax)
+            values.append(value)
+        if not axes:
+            raise ValueError("fixed must name at least one axis.")
+        if len(axes) == self.ndim:
+            raise ValueError("Fixing every axis leaves nothing to interpolate; use evaluate() instead.")
+        return axes, values
+
+    def _axis_position(self, key):
+        """Index of the axis named `key`, or `key` itself if it is a valid integer index."""
+        if isinstance(key, str):
+            try:
+                return self._axis_names.index(key)
+            except ValueError:
+                raise KeyError(f"No axis named {key!r}; the axes are {self._axis_names}.") from None
+        if isinstance(key, numbers.Integral) and not isinstance(key, bool):
+            if not -self.ndim <= key < self.ndim:
+                raise KeyError(f"Axis index {key} out of range for {self.ndim} axes.")
+            return int(key) % self.ndim
+        raise TypeError(f"Axes are given by name or integer index, not {key!r}.")
+
     # ----------------------------------------------------- coefficients, errors
 
     def get_coefficients(self, full=False):
@@ -479,6 +573,20 @@ class ChebyshevInterpolantND:
             f"kmax={self._kmax}, outputs={self.n_outputs}, nodes={self._nodes!r}, "
             f"dtype={self.dtype})"
         )
+
+
+def _contract_fixed(coeffs, axes, ts):
+    """
+    Contract the given axes of ``coeffs`` with the Chebyshev polynomials at
+    ``ts`` (already mapped to [-1, 1]), keeping the other axes in order.
+    """
+    order = sorted(range(len(axes)), key=lambda i: axes[i], reverse=True)
+    for i in order:
+        # Highest axis first, so the indices of the remaining fixed axes stay valid
+        ax = axes[i]
+        basis = chebyshev_basis_batch(np.array([ts[i]]), coeffs.shape[ax], np)[0]
+        coeffs = np.tensordot(coeffs, basis, axes=([ax], [0]))
+    return np.ascontiguousarray(coeffs)
 
 
 def _parse_domains(domains):
