@@ -1,7 +1,7 @@
 """Node generation, coefficient computation, and pruning utilities."""
 
 import numpy as np
-from scipy.fft import dctn
+from scipy.fft import dctn, idctn
 from numba import njit
 
 
@@ -213,6 +213,59 @@ def compute_chebyshev_coefficients_nd(f_values: np.ndarray,nodes = 'Chebyshev', 
     else:
         raise ValueError('Incorrect node type. Please choose either Chebyshev or GaussLobatto')
     return coeffs
+
+
+def chebyshev_values_at_nodes_nd(coeffs, nodes='Chebyshev', axes=None):
+    """
+    Evaluate a tensor Chebyshev series at the nodes of its own grid.
+
+    The inverse of :func:`compute_chebyshev_coefficients_nd`: for a series
+    with N_i coefficients along axis i, return its values on the tensor grid
+    of N_i nodes per axis, with one inverse DCT. Use it to get, for
+    example, the values of a derivative at the nodes where the original
+    function was sampled.
+
+    Parameters
+    ----------
+    coeffs : np.ndarray
+        n-dimensional array of Chebyshev coefficients (real or complex).
+    nodes : str, optional
+        Node family of the grid: 'Chebyshev' (default) or 'GaussLobatto'.
+    axes : sequence of int, optional
+        Axes that hold Chebyshev coefficients. Defaults to all axes; any
+        other axis (e.g. a trailing axis of independent functions) is left
+        alone.
+
+    Returns
+    -------
+    np.ndarray
+        Values at the nodes, same shape as ``coeffs``, in the order the
+        node functions return them (``indexing='ij'``).
+    """
+    ndim = np.ndim(coeffs)
+    axes = _normalize_axes(axes, ndim)
+    raw = np.array(coeffs, dtype=np.result_type(coeffs, np.float64))
+    if nodes == 'Chebyshev':
+        # Undo renormalize_coefficients_Chebyshev
+        for ax in axes:
+            sl = [slice(None)] * ndim
+            sl[ax] = 0
+            raw[tuple(sl)] *= 2.0
+            raw *= raw.shape[ax]
+        return idctn(raw, type=2, norm=None, axes=axes)
+    elif nodes == 'GaussLobatto':
+        # Undo renormalize_coefficients_GL
+        if any(raw.shape[ax] < 2 for ax in axes):
+            raise ValueError("All transformed dimensions must have size >= 2 for Gauss-Lobatto nodes.")
+        for ax in axes:
+            n = raw.shape[ax]
+            sl = [slice(None)] * ndim
+            for plane in (0, n - 1):
+                sl[ax] = plane
+                raw[tuple(sl)] *= 2.0
+            raw *= (n - 1)
+        return idctn(raw, type=1, norm=None, axes=axes)
+    raise ValueError('Incorrect node type. Please choose either Chebyshev or GaussLobatto')
 
 
 def prune_trailing_slices_greedy_nd(coeffs, delta=1e-10, scale='max'):

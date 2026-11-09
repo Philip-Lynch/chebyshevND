@@ -28,6 +28,7 @@ from .utils import (
     renormalize_coefficients_GL,
     renormalize_coefficients_Chebyshev,
     compute_chebyshev_coefficients_nd,
+    chebyshev_values_at_nodes_nd,
     chebyshev_nodes,
     chebyshev_gauss_lobatto_nodes,
     prune_trailing_slices_greedy_nd
@@ -52,6 +53,7 @@ __all__ = [
     "renormalize_coefficients_GL",
     "renormalize_coefficients_Chebyshev",
     "compute_chebyshev_coefficients_nd",
+    "chebyshev_values_at_nodes_nd",
     "chebyshev_nodes",
     "chebyshev_gauss_lobatto_nodes",
     "prune_trailing_slices_greedy_nd"
