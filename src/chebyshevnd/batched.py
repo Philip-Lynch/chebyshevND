@@ -19,6 +19,8 @@ The functions here are pure: they return new arrays and never raise on
 points outside the domain. Instead, they return a per-point status bitmask.
 """
 
+import math
+
 from .backend import array_namespace
 
 #: Memory allowed for the intermediate array of one chunk when evaluating a
@@ -154,3 +156,95 @@ def _contract_axes(partial, ts, k, first, xp):
         partial = partial.reshape(n_points, k[ax], -1)
         partial = xp.matmul(basis[:, None, :], partial)[:, 0, :]
     return partial
+
+
+def precontract_tables(coeffs, a, b, fixed_axes, fixed_values, tol=1e-12, status_axes=None):
+    """
+    Build per-member tables by fixing some axes of a shared table at
+    per-member values.
+
+    Member j's table is the shared table with axis ``fixed_axes[i]`` fixed at
+    ``fixed_values[j, i]``. The fixed axes are moved to the front and each
+    member's Chebyshev values on them are multiplied into one row of a
+    matrix W, so every table comes out of a single GEMM,
+    ``W @ table.reshape(k_fixed, rest)``. That avoids the large
+    intermediate of contracting one fixed axis at a time.
+
+    Parameters
+    ----------
+    coeffs : array, shape (k_1, ..., k_d, F)
+        Shared table, float64 or complex128.
+    a, b : array-like, shape (d,)
+        Lower and upper bound of each axis.
+    fixed_axes : sequence of int
+        Distinct axes to fix.
+    fixed_values : array, shape (B, len(fixed_axes))
+        The value of each fixed axis for each member.
+    tol : float, optional
+        Allowed overshoot outside the domain, as a fraction of each axis's
+        half-width.
+    status_axes : sequence of int, optional
+        The status bit to use for each fixed axis; defaults to
+        ``fixed_axes``. Useful when ``coeffs`` is a reordered copy of a
+        table whose own axis numbering should appear in the status.
+
+    Returns
+    -------
+    tables : array, shape (B, k_live..., F)
+        One table per member over the remaining axes, in their original order.
+    status : int64 array, shape (B,)
+        Bit ``status_axes[i]`` of ``status[j]`` is set when member j's value
+        for fixed axis i lies outside its domain (beyond ``tol``) or is NaN;
+        such a member's table is an extrapolation and should not be used.
+
+    Notes
+    -----
+    If the fixed axes are not already the leading axes, the table is
+    transposed (copied) on each call. Callers that fix the same axes
+    repeatedly should store the table with those axes first.
+    """
+    fixed_axes = [int(ax) for ax in fixed_axes]
+    xp = array_namespace(coeffs, fixed_values)
+    values = xp.asarray(fixed_values, dtype=xp.float64)
+    coeffs = xp.asarray(coeffs)
+    d = coeffs.ndim - 1
+    if values.ndim != 2 or values.shape[1] != len(fixed_axes):
+        raise ValueError(
+            f"fixed_values must have shape (B, {len(fixed_axes)}); got {tuple(values.shape)}."
+        )
+    if len(set(fixed_axes)) != len(fixed_axes) or not all(0 <= ax < d for ax in fixed_axes):
+        raise ValueError(f"fixed_axes must be distinct axes in [0, {d}); got {fixed_axes}.")
+    is_complex = coeffs.dtype.kind == "c"
+    dtype = xp.complex128 if is_complex else xp.float64
+    n_members = values.shape[0]
+
+    a = xp.asarray(a, dtype=xp.float64)[fixed_axes]
+    b = xp.asarray(b, dtype=xp.float64)[fixed_axes]
+    ts = (2.0 * values - a - b) / (b - a)
+    outside = ~(xp.abs(ts) <= 1.0 + tol)
+    bits = fixed_axes if status_axes is None else [int(ax) for ax in status_axes]
+    weights = xp.asarray([1 << ax for ax in bits], dtype=xp.int64)
+    status = (outside * weights).sum(axis=1)
+
+    live = [ax for ax in range(d) if ax not in fixed_axes]
+    k_fixed = [coeffs.shape[ax] for ax in fixed_axes]
+    k_live = [coeffs.shape[ax] for ax in live]
+    n_out = coeffs.shape[-1]
+
+    # Fixed axes first, then the live ones, then the output axis
+    table = xp.ascontiguousarray(xp.transpose(coeffs, fixed_axes + live + [d]), dtype=dtype)
+    if is_complex:
+        table = table.view(xp.float64)
+    flat = table.reshape(math.prod(k_fixed), -1)
+
+    # Row j of W is the outer product of member j's bases on the fixed axes,
+    # flattened in the same (C) order as the fixed axes of `flat`
+    weights_matrix = chebyshev_basis_batch(ts[:, 0], k_fixed[0], xp)
+    for i in range(1, len(fixed_axes)):
+        basis = chebyshev_basis_batch(ts[:, i], k_fixed[i], xp)
+        weights_matrix = (weights_matrix[:, :, None] * basis[:, None, :]).reshape(n_members, -1)
+
+    tables = xp.ascontiguousarray(weights_matrix @ flat)
+    if is_complex:
+        tables = tables.view(xp.complex128)
+    return tables.reshape((n_members,) + tuple(k_live) + (n_out,)), status
