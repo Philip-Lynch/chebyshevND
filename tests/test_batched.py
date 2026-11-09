@@ -130,7 +130,9 @@ def test_chunking_gives_same_result():
     whole, _ = evaluate_batch(nd.get_coefficients(), a, b, pts)
     # Small enough to force a chunk of a single point
     chunked, _ = evaluate_batch(nd.get_coefficients(), a, b, pts, max_chunk_bytes=1)
-    np.testing.assert_array_equal(whole, chunked)
+    # BLAS may sum in a different order for different matrix sizes, so the
+    # results agree to rounding rather than bit for bit
+    np.testing.assert_allclose(whole, chunked, rtol=1e-13, atol=1e-16)
 
 
 def test_basis_matches_cosine_formula_inside():
