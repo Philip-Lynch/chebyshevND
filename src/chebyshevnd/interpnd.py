@@ -18,23 +18,30 @@ class ChebyshevInterpolantND:
     one axis at a time with Chebyshev polynomial values at the point, in
     compiled code.
 
+    Several functions sampled on the same grid can share one interpolant:
+    give their values along a trailing function axis, and name them with
+    ``output_names``. They are then evaluated together, at little more cost
+    than one.
+
     Evaluation reuses scratch buffers held by the instance, so one instance
     must not be evaluated from several threads at once.
     """
 
-    def __init__(self, vals, domains, nodes="Chebyshev", axis_names=None):
+    def __init__(self, vals, domains, nodes="Chebyshev", axis_names=None, output_names=None):
         """
         Construct an nD Chebyshev interpolant from values sampled on a tensor grid.
 
         Parameters
         ----------
         vals : array-like
-            Real or complex function values of shape (N_1, ..., N_d), sampled on the tensor
-            grid of the chosen node family (``chebyshev_nodes`` per axis for
+            Real or complex function values sampled on the tensor grid of
+            the chosen node family (``chebyshev_nodes`` per axis for
             'Chebyshev', ``chebyshev_gauss_lobatto_nodes`` for 'GaussLobatto')
             with ``np.meshgrid(..., indexing='ij')`` ordering, so that axis k
             of ``vals`` is variable k. Sample each axis at its nodes in the
-            order returned (descending).
+            order returned (descending). Shape (N_1, ..., N_d) for one
+            function, or (N_1, ..., N_d, F) for F functions on the same grid,
+            in which case ``output_names`` is required.
         domains : sequence of (float, float)
             One (lower, upper) pair per axis of ``vals``, in axis order: the
             same pairs used to generate the nodes. Each lower bound must be
@@ -45,6 +52,11 @@ class ChebyshevInterpolantND:
         axis_names : sequence of str, optional
             One name per axis, e.g. ``("nu", "u", "e")``. Defaults to
             ``("x0", "x1", ...)``.
+        output_names : sequence of str, optional
+            One name per function along the trailing function axis of
+            ``vals``. Giving it is what declares that axis: without it,
+            ``vals`` must have exactly one axis per domain, so a missing
+            domain cannot be mistaken for a function axis.
         """
         vals = np.asarray(vals)
         # Two dtypes only (design doc A4): complex input stays complex
@@ -53,31 +65,46 @@ class ChebyshevInterpolantND:
 
         a, b = _parse_domains(domains)
         d = a.shape[0]
-        if vals.ndim != d:
+        self._single = output_names is None
+        if self._single and vals.ndim != d:
+            hint = (" If its last axis holds several functions, pass output_names."
+                    if vals.ndim == d + 1 else "")
             raise ValueError(
-                f"vals has {vals.ndim} axes but {d} domains were given; "
-                "give one (lower, upper) pair per axis of vals."
+                f"vals has {vals.ndim} axes but {d} domains were given; give one "
+                f"(lower, upper) pair per axis of vals.{hint}"
             )
+        if not self._single and vals.ndim != d + 1:
+            raise ValueError(
+                f"output_names was given, so vals needs {d} grid axes plus a trailing "
+                f"function axis ({d + 1} axes); it has {vals.ndim}."
+            )
+        grid_shape = vals.shape[:d]
         if nodes not in _NODE_FAMILIES:
             raise ValueError(f"nodes must be one of {_NODE_FAMILIES}, got {nodes!r}.")
         min_nodes = 2 if nodes == "GaussLobatto" else 1
-        if any(n < min_nodes for n in vals.shape):
+        if any(n < min_nodes for n in grid_shape):
             raise ValueError(
                 f"Every axis needs at least {min_nodes} node(s) for nodes={nodes!r}; "
-                f"got shape {vals.shape}."
+                f"got grid shape {grid_shape}."
             )
 
         self._a, self._b = a, b
         self._nodes = nodes
         self._axis_names = _parse_names(axis_names, d, "x", "axis_names")
-        self._grid_shape = tuple(int(n) for n in vals.shape)
+        self._grid_shape = tuple(int(n) for n in grid_shape)
+        n_out = 1 if self._single else vals.shape[-1]
+        if n_out < 1:
+            raise ValueError("The function axis of vals is empty.")
+        self._output_names = () if self._single else _parse_names(output_names, n_out, "f", "output_names")
+        self._output_index = {name: i for i, name in enumerate(self._output_names)}
 
         # Coefficients always carry a trailing output axis internally
-        coeffs = compute_chebyshev_coefficients_nd(vals, nodes=nodes)
-        self._coeffs_full = np.ascontiguousarray(coeffs[..., np.newaxis])
+        coeffs = compute_chebyshev_coefficients_nd(vals, nodes=nodes, axes=range(d))
+        if self._single:
+            coeffs = coeffs[..., np.newaxis]
+        self._coeffs_full = np.ascontiguousarray(coeffs)
 
         abs_c = np.abs(self._coeffs_full)
-        n_out = abs_c.shape[-1]
         self._scale = abs_c.reshape(-1, n_out).max(axis=0)
         self._interp_error = _trailing_error_estimate(abs_c)
         self._discarded = np.zeros(n_out)
@@ -128,6 +155,21 @@ class ChebyshevInterpolantND:
         return self._axis_names
 
     @property
+    def n_outputs(self):
+        """Number of functions F held by the interpolant (1 without a function axis)."""
+        return self._coeffs.shape[-1]
+
+    @property
+    def output_names(self):
+        """The name of each function; empty without a function axis."""
+        return self._output_names
+
+    @property
+    def output_index(self):
+        """Mapping from function name to its position in evaluation results."""
+        return dict(self._output_index)
+
+    @property
     def dtype(self):
         """Coefficient dtype: float64, or complex128 for complex values."""
         return self._coeffs.dtype
@@ -150,14 +192,18 @@ class ChebyshevInterpolantND:
 
         Returns
         -------
-        float or complex
-            Value of the interpolant at the point (complex for complex
-            values).
+        float, complex or np.ndarray
+            For a single function, its value (complex for complex values).
+            With a function axis, an array of shape (F,).
         """
         x = self._point(xs)
         evaluate_point(self._flat, self._shape, self._a, self._b, x, self._ts,
                        self._basis, self._work_a, self._work_b, self._out)
-        return self._out[0].item()
+        return self._result(self._out)
+
+    def _result(self, out):
+        """Return the scalar for a single function, otherwise a copy of the array."""
+        return out[0].item() if self._single else out.copy()
 
     def _point(self, xs):
         """Validate scalar coordinates and return them as a float64 array."""
@@ -189,13 +235,16 @@ class ChebyshevInterpolantND:
         Returns
         -------
         np.ndarray
-            The coefficient tensor.
+            The coefficient tensor, with the function axis last when there
+            is one.
         """
         if full:
             if self._coeffs_full is None:
                 raise RuntimeError("The full coefficient tensor was dropped by optimize(keep_full=False).")
-            return self._coeffs_full[..., 0]
-        return self._coeffs[..., 0]
+            coeffs = self._coeffs_full
+        else:
+            coeffs = self._coeffs
+        return coeffs[..., 0] if self._single else coeffs
 
     def absolute_error(self):
         """
@@ -208,23 +257,28 @@ class ChebyshevInterpolantND:
 
         Returns
         -------
-        float
-            Absolute error estimate.
+        float or np.ndarray
+            Absolute error estimate; an array of shape (F,), one per
+            function, when there is a function axis.
         """
-        return float((self._interp_error + self._discarded)[0])
+        err = self._interp_error + self._discarded
+        return float(err[0]) if self._single else err
 
     def relative_error(self):
         """
         Estimate the relative error: :meth:`absolute_error` divided by the
-        largest coefficient magnitude.
+        largest coefficient magnitude, per function.
 
         Returns
         -------
-        float
-            Relative error estimate.
+        float or np.ndarray
+            Relative error estimate; an array of shape (F,) when there is a
+            function axis.
         """
-        scale = self._scale[0]
-        return float((self._interp_error + self._discarded)[0] / scale) if scale > 0 else 0.0
+        err = self._interp_error + self._discarded
+        safe = np.where(self._scale > 0, self._scale, 1.0)
+        rel = np.where(self._scale > 0, err / safe, 0.0)
+        return float(rel[0]) if self._single else rel
 
     # ------------------------------------------------------------- truncation
 
@@ -232,7 +286,9 @@ class ChebyshevInterpolantND:
         """
         Truncate the series by greedily removing trailing coefficient slices
         while the sum of the removed magnitudes stays below
-        ``rel_tol`` times the largest coefficient magnitude.
+        ``rel_tol`` times the largest coefficient magnitude. With a function
+        axis, one truncation is shared by all functions and the bound holds
+        for each function relative to its own largest coefficient.
 
         Truncation always starts from the full tensor, so ``optimize`` can
         be called again with a different tolerance.
@@ -283,7 +339,8 @@ class ChebyshevInterpolantND:
     def __repr__(self):
         return (
             f"ChebyshevInterpolantND(axes={self._axis_names}, grid_shape={self._grid_shape}, "
-            f"kmax={self._kmax}, nodes={self._nodes!r}, dtype={self.dtype})"
+            f"kmax={self._kmax}, outputs={self.n_outputs}, nodes={self._nodes!r}, "
+            f"dtype={self.dtype})"
         )
 
 

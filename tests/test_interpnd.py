@@ -270,3 +270,107 @@ def test_real_input_stays_real():
     assert nd.dtype == np.float64
     integer_vals = ChebyshevInterpolantND(np.arange(12).reshape(3, 4), [(0, 1), (0, 1)])
     assert integer_vals.dtype == np.float64
+
+
+# --------------------------------------------------------------- multi-output
+
+MULTI_DOMAINS = [(0.0, 2.0), (-1.0, 3.0), (1.0, 4.0)]
+MULTI_NS = (22, 16, 12)
+MULTI_FUNCS = {
+    "wave": lambda x, y, z: np.sin(x) * np.cos(y) * np.exp(-z),
+    "tiny": lambda x, y, z: 1e-6 * (x * y + z**2),
+    "bump": lambda x, y, z: np.exp(-((x - 1) ** 2) - 0.1 * y**2) / z,
+}
+
+
+def build_multi(dtype=float):
+    axes = [np.asarray(a) for a in sample_on_grid(lambda *x: x[0], MULTI_DOMAINS, MULTI_NS)[0]]
+    grids = np.meshgrid(*axes, indexing="ij")
+    vals = np.stack([f(*grids) for f in MULTI_FUNCS.values()], axis=-1).astype(dtype)
+    nd = ChebyshevInterpolantND(vals, MULTI_DOMAINS, output_names=list(MULTI_FUNCS))
+    singles = [ChebyshevInterpolantND(vals[..., i], MULTI_DOMAINS) for i in range(vals.shape[-1])]
+    return nd, singles
+
+
+@pytest.mark.parametrize("dtype", [float, complex])
+def test_multi_output_equals_stacked_single_outputs(dtype):
+    nd, singles = build_multi(dtype)
+    for p in random_points(MULTI_DOMAINS, 20):
+        got = nd.evaluate(*p)
+        assert got.shape == (3,)
+        np.testing.assert_allclose(got, [s.evaluate(*p) for s in singles], rtol=1e-15, atol=1e-18)
+
+
+def test_output_names_and_index():
+    nd, _ = build_multi()
+    assert nd.n_outputs == 3
+    assert nd.output_names == ("wave", "tiny", "bump")
+    assert nd.output_index == {"wave": 0, "tiny": 1, "bump": 2}
+    p = random_points(MULTI_DOMAINS, 1)[0]
+    assert nd.evaluate(*p)[nd.output_index["tiny"]] == pytest.approx(MULTI_FUNCS["tiny"](*p), rel=1e-10)
+    single = ChebyshevInterpolantND(np.ones((3, 3)), [(0, 1), (0, 1)])
+    assert single.n_outputs == 1 and single.output_names == () and single.output_index == {}
+
+
+def test_evaluate_returns_independent_arrays():
+    nd, _ = build_multi()
+    p, q = random_points(MULTI_DOMAINS, 2)
+    first = nd.evaluate(*p)
+    second = nd.evaluate(*q)
+    assert not np.shares_memory(first, second)
+    np.testing.assert_array_equal(first, nd.evaluate(*p))
+
+
+def test_multi_output_coefficients_and_errors_per_function():
+    nd, singles = build_multi()
+    assert nd.get_coefficients().shape == MULTI_NS + (3,)
+    assert nd.get_coefficients(full=True).shape == MULTI_NS + (3,)
+    np.testing.assert_allclose(nd.absolute_error(), [s.absolute_error() for s in singles], rtol=1e-14)
+    np.testing.assert_allclose(nd.relative_error(), [s.relative_error() for s in singles], rtol=1e-14)
+
+
+def test_multi_output_optimize_bound_holds_per_function():
+    # "tiny" is 10^6 times smaller than the others; the shared truncation
+    # must still bound its error relative to its own scale
+    nd, _ = build_multi()
+    points = random_points(MULTI_DOMAINS, 40)
+    before = np.array([nd.evaluate(*p) for p in points])
+    scales = np.abs(nd.get_coefficients(full=True)).reshape(-1, 3).max(axis=0)
+    rel_tol = 1e-6
+    nd.optimize(rel_tol)
+    assert nd.kmax < nd.grid_shape
+    assert nd.get_coefficients().shape == nd.kmax + (3,)
+    after = np.array([nd.evaluate(*p) for p in points])
+    assert np.all(np.abs(after - before).max(axis=0) <= rel_tol * scales)
+
+
+def test_function_axis_requires_output_names():
+    nd, _ = build_multi()
+    vals = np.ones(MULTI_NS + (3,))
+    with pytest.raises(ValueError, match="pass output_names"):
+        ChebyshevInterpolantND(vals, MULTI_DOMAINS)
+    with pytest.raises(ValueError, match="trailing function axis"):
+        ChebyshevInterpolantND(np.ones(MULTI_NS), MULTI_DOMAINS, output_names=["a"])
+    with pytest.raises(ValueError):
+        ChebyshevInterpolantND(vals, MULTI_DOMAINS, output_names=["a", "b"])
+    with pytest.raises(ValueError):
+        ChebyshevInterpolantND(vals, MULTI_DOMAINS, output_names=["a", "a", "b"])
+    with pytest.raises(ValueError):
+        ChebyshevInterpolantND(np.ones(MULTI_NS + (0,)), MULTI_DOMAINS, output_names=[])
+
+
+def test_single_named_output_keeps_function_axis():
+    vals = np.ones((4, 5, 1))
+    nd = ChebyshevInterpolantND(vals, [(0, 1), (0, 1)], output_names=["H"])
+    assert nd.evaluate(0.2, 0.3).shape == (1,)
+
+
+def test_gauss_lobatto_multi_output_checks_only_grid_axes():
+    axes = [np.asarray(a) for a in sample_on_grid(lambda *x: x[0], MULTI_DOMAINS, MULTI_NS, nodes="GaussLobatto")[0]]
+    grids = np.meshgrid(*axes, indexing="ij")
+    vals = MULTI_FUNCS["wave"](*grids)[..., np.newaxis]
+    nd = ChebyshevInterpolantND(vals, MULTI_DOMAINS, nodes="GaussLobatto", output_names=["wave"])
+    single = ChebyshevInterpolantND(vals[..., 0], MULTI_DOMAINS, nodes="GaussLobatto")
+    for p in random_points(MULTI_DOMAINS, 5):
+        assert nd.evaluate(*p)[0] == pytest.approx(single.evaluate(*p), rel=1e-15)
+        assert nd.evaluate(*p)[0] == pytest.approx(MULTI_FUNCS["wave"](*p), abs=1e-10)
