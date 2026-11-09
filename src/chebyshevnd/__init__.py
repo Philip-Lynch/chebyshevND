@@ -8,7 +8,8 @@ from .interp1d import ChebyshevInterpolant1D
 from .interp2d import ChebyshevInterpolant2D
 from .interp3d import ChebyshevInterpolant3D
 from .interp4d import ChebyshevInterpolant4D
-from .interpnd import ChebyshevInterpolantND, OutOfDomainError
+from .errors import OutOfDomainError
+from .interpnd import ChebyshevInterpolantND
 from .batched import evaluate_batch
 
 # Clenshaw evaluation kernels

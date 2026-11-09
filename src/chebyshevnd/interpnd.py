@@ -4,14 +4,11 @@ import numpy as np
 
 from .backend import array_namespace, to_numpy
 from .batched import evaluate_batch as _evaluate_batch
+from .errors import OutOfDomainError, describe_out_of_domain
 from .kernels import evaluate_point
 from .utils import compute_chebyshev_coefficients_nd, prune_trailing_slices_greedy_nd
 
 _NODE_FAMILIES = ("Chebyshev", "GaussLobatto")
-
-
-class OutOfDomainError(ValueError):
-    """Raised when an interpolant is evaluated outside its domain."""
 
 
 class ChebyshevInterpolantND:
@@ -134,11 +131,46 @@ class ChebyshevInterpolantND:
 
     # ------------------------------------------------------------------ setup
 
+    @classmethod
+    def _from_tables(cls, coeffs, coeffs_full, a, b, *, nodes, axis_names, output_names,
+                     domain_tol, abs_error, grid_shape):
+        """
+        Build an interpolant directly from coefficient tensors, e.g. the result
+        of a precontraction.
+
+        ``coeffs`` (the evaluation tensor) and ``coeffs_full`` (or None) carry
+        a trailing output axis. ``output_names`` is empty for a single
+        function. ``abs_error`` (one value per output) becomes the error
+        estimate: it is inherited from the parent, whose bound still holds.
+        """
+        self = cls.__new__(cls)
+        self._single = len(output_names) == 0
+        self._domain_tol = domain_tol
+        self._a, self._b = np.asarray(a, dtype=np.float64), np.asarray(b, dtype=np.float64)
+        self._bounds = np.stack([self._a, self._b])
+        self._nodes = nodes
+        self._axis_names = tuple(axis_names)
+        self._grid_shape = tuple(int(n) for n in grid_shape)
+        self._output_names = tuple(output_names)
+        self._output_index = {name: i for i, name in enumerate(self._output_names)}
+        self._coeffs_full = None if coeffs_full is None else np.ascontiguousarray(coeffs_full)
+        reference = coeffs if coeffs_full is None else coeffs_full
+        n_out = reference.shape[-1]
+        self._scale = np.abs(reference).reshape(-1, n_out).max(axis=0)
+        self._interp_error = np.array(abs_error, dtype=np.float64)
+        self._discarded = np.zeros(n_out)
+        self._x = np.empty(self._a.shape[0])
+        self._set_compact(coeffs)
+        return self
+
     def _set_truncation(self, kmax):
-        """Keep the leading ``kmax`` block as the compact evaluation tensor (A2)."""
-        block = tuple(slice(k) for k in kmax)
-        self._kmax = tuple(int(k) for k in kmax)
-        self._coeffs = np.ascontiguousarray(self._coeffs_full[block])
+        """Keep the leading ``kmax`` block of the full tensor as the compact evaluation tensor (A2)."""
+        self._set_compact(self._coeffs_full[tuple(slice(int(k)) for k in kmax)])
+
+    def _set_compact(self, coeffs):
+        """Make ``coeffs`` (trailing output axis included) the evaluation tensor."""
+        self._coeffs = np.ascontiguousarray(coeffs)
+        self._kmax = tuple(int(k) for k in self._coeffs.shape[:-1])
         self._flat = self._coeffs.reshape(-1)
         self._shape = np.array(self._kmax, dtype=np.int64)
         rest = self._flat.shape[0] // self._kmax[0]
@@ -306,10 +338,7 @@ class ChebyshevInterpolantND:
 
     def _domain_message(self, x, status):
         """Describe which coordinates of `x` are outside the domain, from a status bitmask."""
-        return "; ".join(
-            f"{self._axis_names[i]} = {float(x[i])!r} not in [{float(self._a[i])!r}, {float(self._b[i])!r}]"
-            for i in range(self.ndim) if status >> i & 1
-        )
+        return describe_out_of_domain(self._axis_names, self._a, self._b, x, status)
 
     def _result(self, out):
         """Return the scalar for a single function, otherwise a copy of the array."""
