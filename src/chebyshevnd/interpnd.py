@@ -2,6 +2,8 @@
 
 import numpy as np
 
+from .backend import array_namespace, to_numpy
+from .batched import evaluate_batch as _evaluate_batch
 from .kernels import evaluate_point
 from .utils import compute_chebyshev_coefficients_nd, prune_trailing_slices_greedy_nd
 
@@ -26,6 +28,9 @@ class ChebyshevInterpolantND:
     give their values along a trailing function axis, and name them with
     ``output_names``. They are then evaluated together, at little more cost
     than one.
+
+    :meth:`evaluate` handles one point on the CPU. :meth:`evaluate_batch`
+    handles many points at once, on NumPy (CPU) or CuPy (GPU) arrays.
 
     Evaluation reuses scratch buffers held by the instance, so one instance
     must not be evaluated from several threads at once.
@@ -141,6 +146,8 @@ class ChebyshevInterpolantND:
         self._work_a = np.empty(rest, dtype=dtype)
         self._work_b = np.empty(rest, dtype=dtype)
         self._out = np.empty(self._coeffs.shape[-1], dtype=dtype)
+        # Copies of the table on other devices, made on first use
+        self._device_tables = {}
 
     # ------------------------------------------------------------- properties
 
@@ -226,16 +233,83 @@ class ChebyshevInterpolantND:
         status = evaluate_point(self._flat, self._shape, self._a, self._b, x, self._domain_tol,
                                 self._ts, self._basis, self._work_a, self._work_b, self._out)
         if status:
-            raise OutOfDomainError(self._domain_message(x, status))
+            raise OutOfDomainError(
+                "Point outside the interpolation domain: " + self._domain_message(x, status) + "."
+            )
         return self._result(self._out)
+
+    def evaluate_batch(self, points, return_status=False):
+        """
+        Evaluate the interpolant at many points at once.
+
+        Runs on whichever library ``points`` comes from: NumPy arrays are
+        evaluated on the CPU, CuPy arrays on the GPU. On the first CuPy call
+        the coefficients are copied to the GPU once and kept there.
+
+        Parameters
+        ----------
+        points : array, shape (B, d)
+            One point per row, coordinates in axis order. For a
+            1-dimensional interpolant a shape (B,) array is also accepted.
+        return_status : bool, optional
+            If True, return the per-point status instead of raising for
+            points outside the domain.
+
+        Returns
+        -------
+        values : array
+            Shape (B,) for a single function, (B, F) with a function axis;
+            on the same device as ``points``.
+        status : int64 array, shape (B,)
+            Only if ``return_status``. Bit i of ``status[j]`` is set when
+            coordinate i of point j lies outside its domain or is NaN; the
+            corresponding values are extrapolations and should not be used.
+
+        Raises
+        ------
+        OutOfDomainError
+            If any point is outside the domain and ``return_status`` is False.
+        """
+        xp = array_namespace(points)
+        pts = xp.asarray(points, dtype=xp.float64)
+        if pts.ndim == 1 and self.ndim == 1:
+            pts = pts[:, None]
+        if pts.ndim != 2 or pts.shape[1] != self.ndim:
+            raise ValueError(
+                f"points must have shape (B, {self.ndim}) for axes {self._axis_names}; "
+                f"got {tuple(pts.shape)}."
+            )
+        coeffs, a, b = self._table_on(xp)
+        values, status = _evaluate_batch(coeffs, a, b, pts, tol=self._domain_tol)
+        if self._single:
+            values = values[:, 0]
+        if return_status:
+            return values, status
+        bad = status != 0
+        if bool(xp.any(bad)):
+            first = int(xp.flatnonzero(bad)[0])
+            raise OutOfDomainError(
+                f"{int(bad.sum())} of {pts.shape[0]} points are outside the interpolation domain; "
+                f"the first is point {first}: "
+                + self._domain_message(to_numpy(pts[first]), int(status[first])) + "."
+            )
+        return values
+
+    def _table_on(self, xp):
+        """The compact coefficients and bounds as arrays of module `xp`, cached per device."""
+        if xp is np:
+            return self._coeffs, self._a, self._b
+        key = xp.__name__
+        if key not in self._device_tables:
+            self._device_tables[key] = (xp.asarray(self._coeffs), xp.asarray(self._a), xp.asarray(self._b))
+        return self._device_tables[key]
 
     def _domain_message(self, x, status):
         """Describe which coordinates of `x` are outside the domain, from a status bitmask."""
-        bad = [
+        return "; ".join(
             f"{self._axis_names[i]} = {float(x[i])!r} not in [{float(self._a[i])!r}, {float(self._b[i])!r}]"
             for i in range(self.ndim) if status >> i & 1
-        ]
-        return "Point outside the interpolation domain: " + "; ".join(bad) + "."
+        )
 
     def _result(self, out):
         """Return the scalar for a single function, otherwise a copy of the array."""

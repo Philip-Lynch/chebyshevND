@@ -9,6 +9,7 @@ from .interp2d import ChebyshevInterpolant2D
 from .interp3d import ChebyshevInterpolant3D
 from .interp4d import ChebyshevInterpolant4D
 from .interpnd import ChebyshevInterpolantND, OutOfDomainError
+from .batched import evaluate_batch
 
 # Clenshaw evaluation kernels
 from .clenshaw import(clenshaw_1d,
@@ -37,6 +38,7 @@ __all__ = [
     "ChebyshevInterpolant4D",
     "ChebyshevInterpolantND",
     "OutOfDomainError",
+    "evaluate_batch",
     "clenshaw_1d",
     "clenshaw_2d",
     "clenshaw_3d",
