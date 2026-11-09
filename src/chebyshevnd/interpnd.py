@@ -8,6 +8,7 @@ from .backend import array_namespace, to_numpy
 from .batch import ChebyshevBatch
 from .batched import precontract_tables
 from .batched import evaluate_batch as _evaluate_batch
+from .derivatives import differentiate_coefficients
 from .errors import OutOfDomainError, describe_out_of_domain
 from .kernels import evaluate_point
 from .utils import compute_chebyshev_coefficients_nd, prune_trailing_slices_greedy_nd
@@ -558,6 +559,123 @@ class ChebyshevInterpolantND:
                 raise KeyError(f"Axis index {key} out of range for {self.ndim} axes.")
             return int(key) % self.ndim
         raise TypeError(f"Axes are given by name or integer index, not {key!r}.")
+
+    # ------------------------------------------------------------ derivatives
+
+    def derivative(self, orders):
+        """
+        A partial derivative of the interpolant, as a new interpolant.
+
+        Differentiation happens in coefficient space, so it is exact for the
+        interpolating polynomial. The result composes with everything else:
+        it can be evaluated, precontracted, optimized and differentiated
+        again, and :meth:`values_at_nodes` gives its values on the sampling
+        grid.
+
+        Parameters
+        ----------
+        orders : sequence of int or mapping
+            The derivative order per axis, either one non-negative integer
+            per axis in axis order, e.g. ``(0, 1, 2)``, or a mapping from axis
+            name (or index) to order, e.g. ``{"u": 1, "e": 1}``, with
+            unlisted axes taken as 0.
+
+        Returns
+        -------
+        ChebyshevInterpolantND
+            The derivative with respect to the physical coordinates (the
+            factor ``2 / (b - a)`` per order is included), with the same
+            axes, outputs and domain. It is built from this interpolant's
+            truncated series (so it is the exact derivative of what
+            :meth:`evaluate` computes), and also from the full series if
+            that is still held.
+
+        Notes
+        -----
+        Each derivative loses roughly a factor N^2 of relative accuracy, for
+        N nodes on the differentiated axis, because it amplifies the
+        rounding noise in the coefficients. The error estimate therefore has
+        three parts:
+
+        - the trailing coefficients of the derivative itself;
+        - an exact bound on what this interpolant's truncation contributes;
+        - a rounding term, ``eps * max|c| * prod((N^2 * 2/(b - a))**order)``
+          over the differentiated axes.
+
+        The rounding term is deliberately conservative. It grows with N, so
+        for high derivatives more nodes eventually make the result worse.
+        Choose node counts for the highest derivative you need, and check
+        the estimate.
+        """
+        orders = self._parse_orders(orders)
+        compact = self._differentiate(self._coeffs, orders)
+        full = None if self._coeffs_full is None else self._differentiate(self._coeffs_full, orders)
+
+        # Differentiating removes the top `order` coefficients along each axis
+        keep = tuple(slice(max(k - o, 1)) for k, o in zip(self._kmax, orders))
+        if full is not None:
+            meaningful = tuple(slice(max(n - o, 1)) for n, o in zip(self._grid_shape, orders))
+            interp_error = _trailing_error_estimate(np.abs(full[meaningful]))
+            padded = np.zeros_like(full)
+            padded[tuple(slice(k) for k in self._kmax)] = compact
+            # Exact bound on what the truncation contributes to the derivative
+            truncation = np.abs(full - padded).reshape(-1, full.shape[-1]).sum(axis=0)
+        else:
+            interp_error = _trailing_error_estimate(np.abs(compact[keep]))
+            # Without the full series, scale the discarded sum by Markov's
+            # inequality, |p'| <= n^2 max|p| on [-1, 1] for degree n
+            factor = 1.0
+            for k, o, a, b in zip(self._kmax, orders, self._a, self._b):
+                factor *= (max(k - 1, 1) ** 2 * 2.0 / (b - a)) ** o
+            truncation = self._discarded * factor
+
+        # Rounding noise in the coefficients, amplified by the same Markov
+        # factor; it dominates once a function is resolved to rounding level
+        sizes = self._grid_shape if full is not None else self._kmax
+        amplification = 1.0
+        for n, o, a, b in zip(sizes, orders, self._a, self._b):
+            amplification *= (max(n - 1, 1) ** 2 * 2.0 / (b - a)) ** o
+        rounding = np.finfo(np.float64).eps * self._scale * amplification if any(orders) else 0.0
+
+        return ChebyshevInterpolantND._from_tables(
+            compact[keep], full, self._a, self._b,
+            nodes=self._nodes,
+            axis_names=self._axis_names,
+            output_names=self._output_names,
+            domain_tol=self._domain_tol,
+            abs_error=interp_error + truncation + rounding,
+            grid_shape=self._grid_shape,
+        )
+
+    def _differentiate(self, coeffs, orders):
+        """Differentiate a coefficient tensor (trailing output axis included) by `orders`."""
+        for ax, order in enumerate(orders):
+            if order:
+                scale = (2.0 / (self._b[ax] - self._a[ax])) ** order
+                coeffs = differentiate_coefficients(coeffs, ax, order) * scale
+        return np.ascontiguousarray(coeffs)
+
+    def _parse_orders(self, orders):
+        """Turn a sequence or mapping of derivative orders into one int per axis."""
+        if hasattr(orders, "items"):
+            parsed = [0] * self.ndim
+            seen = set()
+            for key, order in orders.items():
+                ax = self._axis_position(key)
+                if ax in seen:
+                    raise ValueError(f"Axis {self._axis_names[ax]!r} appears more than once in orders.")
+                seen.add(ax)
+                parsed[ax] = order
+        else:
+            parsed = list(orders)
+            if len(parsed) != self.ndim:
+                raise ValueError(
+                    f"orders needs one entry per axis {self._axis_names}; got {len(parsed)}."
+                )
+        for order in parsed:
+            if not isinstance(order, numbers.Integral) or isinstance(order, bool) or order < 0:
+                raise ValueError(f"Derivative orders must be non-negative integers, got {order!r}.")
+        return tuple(int(o) for o in parsed)
 
     # ----------------------------------------------------- coefficients, errors
 

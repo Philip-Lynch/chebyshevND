@@ -12,6 +12,7 @@ from .errors import OutOfDomainError
 from .interpnd import ChebyshevInterpolantND
 from .batch import ChebyshevBatch
 from .batched import evaluate_batch
+from .derivatives import differentiate_coefficients
 
 # Clenshaw evaluation kernels
 from .clenshaw import(clenshaw_1d,
@@ -43,6 +44,7 @@ __all__ = [
     "ChebyshevBatch",
     "OutOfDomainError",
     "evaluate_batch",
+    "differentiate_coefficients",
     "clenshaw_1d",
     "clenshaw_2d",
     "clenshaw_3d",
