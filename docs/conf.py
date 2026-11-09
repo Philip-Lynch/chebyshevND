@@ -36,7 +36,8 @@ for _nb in _examples_src.glob("*.ipynb"):
     shutil.copy(_nb, _examples_dst / _nb.name)
 
 templates_path = []
-exclude_patterns = ["_build"]
+# The NIT design document is a development brief, not user documentation
+exclude_patterns = ["_build", "DESIGN_NIT_v6EPHM.md"]
 
 # -- Options for HTML output -------------------------------------------------
 

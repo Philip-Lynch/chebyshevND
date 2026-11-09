@@ -25,6 +25,16 @@ def rescale_variable(x, a, b):
     return 2 * (x - a) / (b - a) - 1
 
 
+def _normalize_axes(axes, ndim):
+    """Return `axes` as a tuple of non-negative, unique axis indices (all axes if None)."""
+    if axes is None:
+        return tuple(range(ndim))
+    out = tuple(int(ax) % ndim for ax in axes)
+    if len(set(out)) != len(out):
+        raise ValueError(f"Repeated axis in axes={tuple(axes)}.")
+    return out
+
+
 def chebyshev_gauss_lobatto_nodes(N,a,b):
     """
     Generate the N Chebyshev-Gauss-Lobatto (extrema) nodes on [a, b].
@@ -81,7 +91,7 @@ def chebyshev_nodes(N,a,b):
     return x
 
 
-def renormalize_coefficients_GL(coeffs,copy=True):
+def renormalize_coefficients_GL(coeffs,copy=True, axes=None):
     """
     Renormalize raw DCT-I output on a Gauss-Lobatto (extrema) tensor grid to
     standard Chebyshev-series convention, for arbitrary dimension.
@@ -96,6 +106,9 @@ def renormalize_coefficients_GL(coeffs,copy=True):
         Output of ``scipy.fft.dctn(..., type=1, norm=None)``, shape (N1, ..., Nd).
     copy : bool, optional
         If True (default), work on a copy and return it. If False, scale in place.
+    axes : sequence of int, optional
+        Axes that were transformed by the DCT. Defaults to all axes; other
+        axes (e.g. a trailing axis of independent functions) are left alone.
 
     Returns
     -------
@@ -104,19 +117,21 @@ def renormalize_coefficients_GL(coeffs,copy=True):
     """
     arr = coeffs.copy() if copy else coeffs
     shape = arr.shape
+    ndim = arr.ndim
+    axes = _normalize_axes(axes, ndim)
 
-    if any(N < 2 for N in shape):
-        raise ValueError("All dimensions must have size >= 2 for DCT-I normalization.")
+    if any(shape[ax] < 2 for ax in axes):
+        raise ValueError("All transformed dimensions must have size >= 2 for DCT-I normalization.")
 
     # 1) divide by prod(Nr - 1)
     scale = 1.0
-    for N in shape:
-        scale *= (N - 1)
+    for ax in axes:
+        scale *= (shape[ax] - 1)
     arr /= scale
 
     # 2) halve endpoint hyperplanes along each axis
-    ndim = arr.ndim
-    for axis, N in enumerate(shape):
+    for axis in axes:
+        N = shape[axis]
         # first index plane
         sl = [slice(None)] * ndim
         sl[axis] = 0
@@ -128,7 +143,7 @@ def renormalize_coefficients_GL(coeffs,copy=True):
     return arr
 
 
-def renormalize_coefficients_Chebyshev(out: np.ndarray) -> np.ndarray:
+def renormalize_coefficients_Chebyshev(out: np.ndarray, axes=None) -> np.ndarray:
     """
     Renormalize raw DCT-II output on a Chebyshev (root) tensor grid to
     standard Chebyshev-series convention, for arbitrary dimension.
@@ -137,6 +152,9 @@ def renormalize_coefficients_Chebyshev(out: np.ndarray) -> np.ndarray:
     ----------
     out : np.ndarray
         Output of ``scipy.fft.dctn(..., type=2, norm=None)``, n-dimensional.
+    axes : sequence of int, optional
+        Axes that were transformed by the DCT. Defaults to all axes; other
+        axes (e.g. a trailing axis of independent functions) are left alone.
 
     Returns
     -------
@@ -145,25 +163,24 @@ def renormalize_coefficients_Chebyshev(out: np.ndarray) -> np.ndarray:
     """
     shape = out.shape
     ndim = out.ndim
+    axes = _normalize_axes(axes, ndim)
 
-    # Create factor arrays for each axis
-    factors = []
-    for n in shape:
-        f = np.ones(n)
-        f[0] = 2
-        factors.append(f)
+    # Divide by the product of the transformed sizes ...
+    size = 1
+    for ax in axes:
+        size *= shape[ax]
+    normalized = out / size
 
-    # Build the scale tensor via outer products (einsum over all dims)
-    einsum_subscripts = ",".join(chr(ord("a") + i) for i in range(ndim)) + "->" + "".join(chr(ord("a") + i) for i in range(ndim))
-    scale = np.einsum(einsum_subscripts, *factors)
-
-    # Normalize by scale * product of sizes
-    normalized = out / (scale * np.prod(shape))
+    # ... and halve the index-0 hyperplane of each transformed axis
+    for ax in axes:
+        sl = [slice(None)] * ndim
+        sl[ax] = 0
+        normalized[tuple(sl)] *= 0.5
 
     return normalized
 
 
-def compute_chebyshev_coefficients_nd(f_values: np.ndarray,nodes = 'Chebyshev') -> np.ndarray:
+def compute_chebyshev_coefficients_nd(f_values: np.ndarray,nodes = 'Chebyshev', axes=None) -> np.ndarray:
     """
     Compute Chebyshev coefficients for an nD array of function values using a DCT.
 
@@ -176,18 +193,23 @@ def compute_chebyshev_coefficients_nd(f_values: np.ndarray,nodes = 'Chebyshev') 
     nodes : str, optional
         Node family the values were sampled at: 'Chebyshev' (default) or
         'GaussLobatto'.
+    axes : sequence of int, optional
+        Axes that are sampled on Chebyshev nodes. Defaults to all axes. Any
+        other axis (e.g. a trailing axis of independent functions) is not
+        transformed.
 
     Returns
     -------
     np.ndarray
         n-dimensional array of Chebyshev coefficients, same shape as the input.
     """
+    axes = _normalize_axes(axes, np.ndim(f_values))
     if(nodes == 'Chebyshev'):
-        coeffs = dctn(f_values, type=2, norm=None)
-        coeffs = renormalize_coefficients_Chebyshev(coeffs)
+        coeffs = dctn(f_values, type=2, norm=None, axes=axes)
+        coeffs = renormalize_coefficients_Chebyshev(coeffs, axes=axes)
     elif(nodes == 'GaussLobatto'):
-        coeffs = dctn(f_values, type=1, norm=None)
-        coeffs = renormalize_coefficients_GL(coeffs)
+        coeffs = dctn(f_values, type=1, norm=None, axes=axes)
+        coeffs = renormalize_coefficients_GL(coeffs, axes=axes)
     else:
         raise ValueError('Incorrect node type. Please choose either Chebyshev or GaussLobatto')
     return coeffs

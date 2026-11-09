@@ -1,5 +1,5 @@
 """
-Per-call evaluation timings for the 1D-4D interpolants.
+Per-call evaluation timings for the 1D-4D interpolants and ChebyshevInterpolantND.
 
 Run before and after a change to see its effect on evaluation cost:
 
@@ -27,6 +27,7 @@ from chebyshevnd import (
     ChebyshevInterpolant2D,
     ChebyshevInterpolant3D,
     ChebyshevInterpolant4D,
+    ChebyshevInterpolantND,
     chebyshev_nodes,
 )
 
@@ -44,6 +45,12 @@ CASES = {
         [(0.0, 2.0), (-1.0, 3.0), (1.0, 4.0), (-2.0, 0.0)], (12, 12, 12, 12)),
 }
 REL_TOL = 1e-8
+
+# ChebyshevInterpolantND runs the cases above plus this 5D one
+ND_5D = (lambda a, b, c, d, e: np.exp(0.3 * a) * np.cos(0.5 * b) * (1 + 0.2 * c) ** 2
+         * np.sin(0.4 * d + 0.1) * np.cos(e),
+         [(0.0, 1.0), (-1.0, 2.0), (0.5, 1.5), (-2.0, -1.0), (0.0, 0.5)], (12, 10, 8, 8, 6))
+BATCH = 1000
 
 
 def time_us(fn, number=20000, repeat=5):
@@ -80,16 +87,40 @@ def run():
     return results
 
 
+def run_nd():
+    cases = {dim: (f, domains, Ns) for dim, (_, f, domains, Ns) in CASES.items()}
+    cases[5] = ND_5D
+    results = []
+    for dim, (f, domains, Ns) in sorted(cases.items()):
+        axes = [chebyshev_nodes(N, a, b) for N, (a, b) in zip(Ns, domains)]
+        interp = ChebyshevInterpolantND(f(*np.meshgrid(*axes, indexing="ij")), domains)
+        point = [0.5 * (a + b) + 0.1 * (b - a) for a, b in domains]
+        lo, hi = np.array(domains).T
+        batch = np.random.default_rng(0).uniform(lo, hi, size=(BATCH, dim))
+
+        row = {"dim": dim, "grid": list(Ns)}
+        row["evaluate_us"] = time_us(lambda: interp.evaluate(*point))
+        row["batch_us_per_point"] = time_us(lambda: interp.evaluate_batch(batch), number=20) / BATCH
+        interp.optimize(REL_TOL)
+        row["kmax_after_optimize"] = list(interp.kmax)
+        row["evaluate_optimized_us"] = time_us(lambda: interp.evaluate(*point))
+        row["batch_optimized_us_per_point"] = time_us(lambda: interp.evaluate_batch(batch), number=20) / BATCH
+        results.append(row)
+    return results
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[1])
     parser.add_argument("--json", help="also write the results to this JSON file")
     args = parser.parse_args()
 
     results = run()
+    results_nd = run_nd()
     version = importlib.metadata.version("ChebyshevND")
     print(f"chebyshevnd {version} | numpy {np.__version__} | "
           f"scipy {scipy.__version__} | numba {numba.__version__} | "
           f"python {platform.python_version()} | {platform.machine()}")
+    print("\nv0.1 classes (ChebyshevInterpolant1D ... 4D)")
     print(f"{'dim':>3}  {'grid':<18} {'evaluate':>10} {'optimized':>10} "
           f"{'precomputed':>12}  kmax after optimize({REL_TOL:g})")
     for r in results:
@@ -97,6 +128,14 @@ def main():
         pre_s = f"{pre:10.2f}us" if pre is not None else f"{'-':>12}"
         print(f"{r['dim']:>3}  {str(tuple(r['grid'])):<18} {r['evaluate_us']:8.2f}us "
               f"{r['evaluate_optimized_us']:8.2f}us {pre_s}  {tuple(r['kmax_after_optimize'])}")
+
+    print(f"\nChebyshevInterpolantND (batch columns: per point, B = {BATCH})")
+    print(f"{'dim':>3}  {'grid':<18} {'evaluate':>10} {'batch':>10} {'optimized':>10} "
+          f"{'opt. batch':>11}  kmax after optimize({REL_TOL:g})")
+    for r in results_nd:
+        print(f"{r['dim']:>3}  {str(tuple(r['grid'])):<18} {r['evaluate_us']:8.2f}us "
+              f"{r['batch_us_per_point']:8.2f}us {r['evaluate_optimized_us']:8.2f}us "
+              f"{r['batch_optimized_us_per_point']:9.2f}us  {tuple(r['kmax_after_optimize'])}")
 
     if args.json:
         meta = {
@@ -110,7 +149,7 @@ def main():
             "numba": numba.__version__,
         }
         with open(args.json, "w") as fh:
-            json.dump({"meta": meta, "results": results}, fh, indent=2)
+            json.dump({"meta": meta, "results": results, "results_nd": results_nd}, fh, indent=2)
         print(f"wrote {args.json}")
 
 

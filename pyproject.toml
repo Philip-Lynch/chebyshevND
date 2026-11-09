@@ -43,9 +43,14 @@ Issues = "https://github.com/Philip-Lynch/chebyshevND/issues"
 [project.optional-dependencies]
 test = ["pytest"]
 docs = ["sphinx", "furo", "myst-nb"]
+# Batched evaluation on NVIDIA GPUs (CUDA 12)
+gpu = ["cupy-cuda12x"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = [
+    "gpu: needs CuPy and a CUDA device; skipped when either is missing",
+]
