@@ -92,7 +92,7 @@ def test_clenshaw_4d_matches_direct_sum(rng):
 
 
 def test_clenshaw_nd_matches_direct_sum(rng):
-    for shape in [(9,), (5, 6), (4, 5, 3), (3, 4, 3, 5)]:
+    for shape in [(9,), (5, 6), (4, 5, 3), (3, 4, 3, 5), (4, 3, 5, 3, 4), (3, 4, 2, 3, 3, 4)]:
         coeffs = decaying_coeffs(rng, shape)
         ts = rng.uniform(-1.0, 1.0, size=len(shape))
         expected = direct_eval(coeffs, ts)

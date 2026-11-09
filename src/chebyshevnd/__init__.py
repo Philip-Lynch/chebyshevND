@@ -1,7 +1,6 @@
 
 """
 ChebyshevND: Fast multidimensional Chebyshev interpolation in Python.
-Currently supports up to 4D interpolation. Higher dimensions coming soon!
 """
 
 # Core interpolant classes
@@ -9,6 +8,7 @@ from .interp1d import ChebyshevInterpolant1D
 from .interp2d import ChebyshevInterpolant2D
 from .interp3d import ChebyshevInterpolant3D
 from .interp4d import ChebyshevInterpolant4D
+from .interpnd import ChebyshevInterpolantND
 
 # Clenshaw evaluation kernels
 from .clenshaw import(clenshaw_1d,
@@ -35,6 +35,7 @@ __all__ = [
     "ChebyshevInterpolant2D",
     "ChebyshevInterpolant3D",
     "ChebyshevInterpolant4D",
+    "ChebyshevInterpolantND",
     "clenshaw_1d",
     "clenshaw_2d",
     "clenshaw_3d",

@@ -2,6 +2,7 @@
 
 import numpy as np
 from numba import njit
+from .kernels import contract
 from .utils import rescale_variable
 
 
@@ -231,38 +232,17 @@ def partial_clenshaw_4d(coeffs, x_value, a=-1., b=1., kmax = None):
     return temp_yzw
 
 
-def _clenshaw_nd_unit(ts, coeffs):
-    """Recursively evaluate an nD Chebyshev series at a point already scaled to [-1, 1]^n."""
-    d = ts.shape[0]
-
-    # Base case
-    if d == 1:
-        return clenshaw_1d(coeffs, ts[0])
-
-    t_last = ts[-1]
-    shape = coeffs.shape[:-1]
-    tmp = np.empty(shape, dtype=np.float64)
-
-    # Loop explicitly, no np.ndindex (Numba safer with nested loops)
-    it = np.nditer(tmp, flags=['multi_index'], op_flags=['writeonly'])
-    while not it.finished:
-        idx = it.multi_index
-        # Force 1D view along the last axis
-        coeff_vec = coeffs[idx + (slice(None),)]
-        it[0] = clenshaw_1d(coeff_vec, t_last)
-        it.iternext()
-
-    return _clenshaw_nd_unit(ts[:-1], tmp)
-
-
 def clenshaw_nd(coeffs, xs, a=None, b=None, kmax=None):
     """
     Evaluate an nD Chebyshev series at a single point.
 
+    Uses the compiled leading-axis-first contraction of
+    :mod:`chebyshevnd.kernels`, in any dimension.
+
     Parameters
     ----------
     coeffs : np.ndarray
-        nD array of Chebyshev coefficients.
+        nD array of Chebyshev coefficients, real or complex.
     xs : array-like
         The n coordinates of the evaluation point, one per axis of coeffs.
     a, b : array-like, optional
@@ -273,15 +253,25 @@ def clenshaw_nd(coeffs, xs, a=None, b=None, kmax=None):
 
     Returns
     -------
-    float
+    float or complex
         Value of the Chebyshev series at xs.
     """
-    xs = np.asarray(xs, dtype=np.float64)
+    coeffs = np.asarray(coeffs)
+    if kmax is not None:
+        coeffs = coeffs[tuple(slice(int(k)) for k in kmax)]
+    dtype = np.complex128 if np.iscomplexobj(coeffs) else np.float64
+    if coeffs.size == 0:
+        return dtype(0).item()
     d = coeffs.ndim
+    xs = np.asarray(xs, dtype=np.float64).reshape(d)
     a = -np.ones(d) if a is None else np.asarray(a, dtype=np.float64)
     b = np.ones(d) if b is None else np.asarray(b, dtype=np.float64)
 
     ts = (2.0 * xs - a - b) / (b - a)
-    if kmax is not None:
-        coeffs = coeffs[tuple(slice(int(k)) for k in kmax)]
-    return _clenshaw_nd_unit(ts, coeffs)
+    shape = np.array(coeffs.shape, dtype=np.int64)
+    flat = np.ascontiguousarray(coeffs, dtype=dtype).reshape(-1)
+    rest = flat.shape[0] // shape[0]
+    out = np.empty(1, dtype=dtype)
+    contract(flat, shape, ts, np.empty(shape.max()), np.empty(rest, dtype=dtype),
+             np.empty(rest, dtype=dtype), out)
+    return out[0].item()
