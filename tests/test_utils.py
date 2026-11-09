@@ -114,3 +114,37 @@ def test_prune_all_zero_coefficients():
     kmax, discarded = prune_trailing_slices_greedy_nd(np.zeros((4, 4)), delta=1e-8)
     assert kmax == (0, 0)
     assert discarded == 0.0
+
+
+@pytest.mark.parametrize("nodes", ["Chebyshev", "GaussLobatto"])
+def test_coefficients_over_subset_of_axes_match_per_function(nodes):
+    # A trailing axis of independent functions must not be transformed: the
+    # result equals fitting each function on its own.
+    rng = np.random.default_rng(3)
+    vals = rng.standard_normal((7, 5, 4)) + 1j * rng.standard_normal((7, 5, 4))
+    together = compute_chebyshev_coefficients_nd(vals, nodes=nodes, axes=(0, 1))
+    for f in range(vals.shape[-1]):
+        alone = compute_chebyshev_coefficients_nd(vals[..., f], nodes=nodes)
+        np.testing.assert_allclose(together[..., f], alone, rtol=1e-13, atol=1e-15)
+
+
+def test_coefficients_axes_default_is_all_axes():
+    rng = np.random.default_rng(4)
+    vals = rng.standard_normal((6, 5, 3))
+    np.testing.assert_array_equal(
+        compute_chebyshev_coefficients_nd(vals),
+        compute_chebyshev_coefficients_nd(vals, axes=(0, 1, 2)),
+    )
+
+
+def test_renormalize_gl_only_checks_transformed_axes():
+    # A length-1 function axis is fine as long as it is not transformed
+    coeffs = np.ones((4, 5, 1))
+    renormalize_coefficients_GL(coeffs, axes=(0, 1))
+    with pytest.raises(ValueError):
+        renormalize_coefficients_GL(coeffs)
+
+
+def test_repeated_axes_rejected():
+    with pytest.raises(ValueError):
+        compute_chebyshev_coefficients_nd(np.ones((4, 4)), axes=(0, -2))

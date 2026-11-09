@@ -1,5 +1,7 @@
 """Shared helpers for the ChebyshevND test suite."""
 
+import string
+
 import numpy as np
 
 from chebyshevnd import chebyshev_nodes, chebyshev_gauss_lobatto_nodes
@@ -15,12 +17,13 @@ def direct_eval(coeffs, ts):
     Evaluate a tensor Chebyshev series at one point by direct summation,
     using T_k(t) = cos(k * arccos(t)). Each t must already lie in [-1, 1].
     Independent of both Clenshaw recursion and numpy's chebval, so it can
-    serve as an oracle for either.
+    serve as an oracle for either. Works in any dimension and returns a
+    Python float, or a complex for complex coefficients.
     """
     vecs = [np.cos(np.arange(n) * np.arccos(t)) for n, t in zip(coeffs.shape, ts)]
-    letters = "ijkl"[: coeffs.ndim]
+    letters = string.ascii_lowercase[: coeffs.ndim]
     subscripts = letters + "," + ",".join(letters) + "->"
-    return float(np.einsum(subscripts, coeffs, *vecs))
+    return np.einsum(subscripts, coeffs, *vecs).item()
 
 
 def decaying_coeffs(rng, shape, base=0.5):
