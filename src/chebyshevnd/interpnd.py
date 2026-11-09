@@ -1,17 +1,18 @@
 """n-dimensional Chebyshev interpolation."""
 
+import numbers
+
 import numpy as np
 
 from .backend import array_namespace, to_numpy
+from .batch import ChebyshevBatch
+from .batched import precontract_tables
 from .batched import evaluate_batch as _evaluate_batch
+from .errors import OutOfDomainError, describe_out_of_domain
 from .kernels import evaluate_point
 from .utils import compute_chebyshev_coefficients_nd, prune_trailing_slices_greedy_nd
 
 _NODE_FAMILIES = ("Chebyshev", "GaussLobatto")
-
-
-class OutOfDomainError(ValueError):
-    """Raised when an interpolant is evaluated outside its domain."""
 
 
 class ChebyshevInterpolantND:
@@ -134,11 +135,46 @@ class ChebyshevInterpolantND:
 
     # ------------------------------------------------------------------ setup
 
+    @classmethod
+    def _from_tables(cls, coeffs, coeffs_full, a, b, *, nodes, axis_names, output_names,
+                     domain_tol, abs_error, grid_shape):
+        """
+        Build an interpolant directly from coefficient tensors, e.g. the result
+        of a precontraction.
+
+        ``coeffs`` (the evaluation tensor) and ``coeffs_full`` (or None) carry
+        a trailing output axis. ``output_names`` is empty for a single
+        function. ``abs_error`` (one value per output) becomes the error
+        estimate: it is inherited from the parent, whose bound still holds.
+        """
+        self = cls.__new__(cls)
+        self._single = len(output_names) == 0
+        self._domain_tol = domain_tol
+        self._a, self._b = np.asarray(a, dtype=np.float64), np.asarray(b, dtype=np.float64)
+        self._bounds = np.stack([self._a, self._b])
+        self._nodes = nodes
+        self._axis_names = tuple(axis_names)
+        self._grid_shape = tuple(int(n) for n in grid_shape)
+        self._output_names = tuple(output_names)
+        self._output_index = {name: i for i, name in enumerate(self._output_names)}
+        self._coeffs_full = None if coeffs_full is None else np.ascontiguousarray(coeffs_full)
+        reference = coeffs if coeffs_full is None else coeffs_full
+        n_out = reference.shape[-1]
+        self._scale = np.abs(reference).reshape(-1, n_out).max(axis=0)
+        self._interp_error = np.array(abs_error, dtype=np.float64)
+        self._discarded = np.zeros(n_out)
+        self._x = np.empty(self._a.shape[0])
+        self._set_compact(coeffs)
+        return self
+
     def _set_truncation(self, kmax):
-        """Keep the leading ``kmax`` block as the compact evaluation tensor (A2)."""
-        block = tuple(slice(k) for k in kmax)
-        self._kmax = tuple(int(k) for k in kmax)
-        self._coeffs = np.ascontiguousarray(self._coeffs_full[block])
+        """Keep the leading ``kmax`` block of the full tensor as the compact evaluation tensor (A2)."""
+        self._set_compact(self._coeffs_full[tuple(slice(int(k)) for k in kmax)])
+
+    def _set_compact(self, coeffs):
+        """Make ``coeffs`` (trailing output axis included) the evaluation tensor."""
+        self._coeffs = np.ascontiguousarray(coeffs)
+        self._kmax = tuple(int(k) for k in self._coeffs.shape[:-1])
         self._flat = self._coeffs.reshape(-1)
         self._shape = np.array(self._kmax, dtype=np.int64)
         rest = self._flat.shape[0] // self._kmax[0]
@@ -146,8 +182,10 @@ class ChebyshevInterpolantND:
         self._scratch = np.empty(len(self._kmax) + max(self._kmax))
         self._work = np.empty((2, rest), dtype=dtype)
         self._out = np.empty(self._coeffs.shape[-1], dtype=dtype)
-        # Copies of the table on other devices, made on first use
+        # Copies of the table on other devices, and copies with a set of
+        # fixed axes moved to the front (for precontraction), made on first use
         self._device_tables = {}
+        self._fixed_first = {}
 
     # ------------------------------------------------------------- properties
 
@@ -306,10 +344,7 @@ class ChebyshevInterpolantND:
 
     def _domain_message(self, x, status):
         """Describe which coordinates of `x` are outside the domain, from a status bitmask."""
-        return "; ".join(
-            f"{self._axis_names[i]} = {float(x[i])!r} not in [{float(self._a[i])!r}, {float(self._b[i])!r}]"
-            for i in range(self.ndim) if status >> i & 1
-        )
+        return describe_out_of_domain(self._axis_names, self._a, self._b, x, status)
 
     def _result(self, out):
         """Return the scalar for a single function, otherwise a copy of the array."""
@@ -326,6 +361,203 @@ class ChebyshevInterpolantND:
         except (TypeError, ValueError):
             raise TypeError("evaluate() takes one scalar per axis.") from None
         return self._x
+
+    # --------------------------------------------------------- precontraction
+
+    def precontract(self, fixed):
+        """
+        Fix some axes at given values and return the interpolant over the others.
+
+        This is the main speed-up when some variables stay constant over many
+        evaluations (e.g. the mass ratio and spins of one waveform): the
+        fixed axes are contracted once, and every later evaluation only
+        works on the much smaller remaining tensor.
+
+        Parameters
+        ----------
+        fixed : mapping
+            Axis name (or index) -> value, e.g. ``{"nu": 0.2, "chi1": 0.5}``.
+            At least one axis must remain. The cost is about one pass over
+            the coefficient tensor, whichever axes are fixed.
+
+        Returns
+        -------
+        ChebyshevInterpolantND
+            An interpolant over the remaining axes, in their original order,
+            with the same outputs, dtype and ``domain_tol``. It evaluates
+            exactly like this interpolant with the fixed values inserted,
+            including any truncation from :meth:`optimize`. If the full
+            coefficient tensor is still held, it is precontracted too, so
+            the result can be optimized again on its own. Its error
+            estimate starts from this interpolant's, which still bounds it.
+
+        Raises
+        ------
+        OutOfDomainError
+            If a fixed value lies outside its axis's domain.
+
+        See Also
+        --------
+        precontract_batch : the same with different values for each member
+            of a batch.
+        """
+        axes, values = self._resolve_fixed(fixed)
+        for value in values:
+            if np.ndim(value) != 0:
+                raise TypeError(
+                    "precontract() takes one value per fixed axis; use precontract_batch() for arrays."
+                )
+        row = np.array([values], dtype=np.float64)
+        # The batched routine with a batch of one: a single GEMM, whatever
+        # the number and position of the fixed axes
+        tables, status = self._precontract_tables(np, axes, row)
+        if status[0]:
+            x = np.full(self.ndim, np.nan)
+            x[axes] = row[0]
+            raise OutOfDomainError(
+                "Fixed value outside the interpolation domain: "
+                + self._domain_message(x, int(status[0])) + "."
+            )
+        coeffs = tables[0]
+        if self._coeffs_full is None:
+            full = None
+        elif self._kmax == self._grid_shape:
+            full = coeffs  # nothing was truncated, so the full tensor gives the same table
+        else:
+            full = self._precontract_tables(np, axes, row, full=True)[0][0]
+
+        live = [i for i in range(self.ndim) if i not in axes]
+        return ChebyshevInterpolantND._from_tables(
+            coeffs, full, self._a[live], self._b[live],
+            nodes=self._nodes,
+            axis_names=[self._axis_names[i] for i in live],
+            output_names=self._output_names,
+            domain_tol=self._domain_tol,
+            abs_error=self._interp_error + self._discarded,
+            grid_shape=[self._grid_shape[i] for i in live],
+        )
+
+    def precontract_batch(self, fixed, return_status=False):
+        """
+        Fix some axes at different values for each member of a batch.
+
+        The batch version of :meth:`precontract`: member j (e.g. one
+        waveform) gets its own table, with the fixed axes at its own values.
+        All tables are built with one matrix multiplication, on the device
+        of the given arrays: NumPy on the CPU, CuPy on the GPU, where this
+        interpolant's coefficients are copied once and cached.
+
+        Parameters
+        ----------
+        fixed : mapping
+            Axis name (or index) -> array of shape (B,) with one value per
+            member, e.g. ``{"nu": nu_values, "chi1": chi1_values}``. Scalars
+            are allowed alongside arrays and apply to every member. At least
+            one axis must remain.
+        return_status : bool, optional
+            If True, return the per-member status of the fixed values
+            instead of raising for values outside the domain.
+
+        Returns
+        -------
+        ChebyshevBatch
+            The per-member tables over the remaining axes.
+        status : int64 array, shape (B,)
+            Only if ``return_status``. Bit i of ``status[j]`` is set when
+            member j's value for axis i (numbered as in this interpolant)
+            lies outside its domain or is NaN.
+
+        Raises
+        ------
+        OutOfDomainError
+            If a fixed value lies outside its domain and ``return_status``
+            is False.
+        """
+        axes, raw = self._resolve_fixed(fixed)
+        xp = array_namespace(*raw)
+        columns = [xp.asarray(v, dtype=xp.float64) for v in raw]
+        if any(c.ndim > 1 for c in columns):
+            raise ValueError("Each fixed value must be a scalar or a 1D array with one value per member.")
+        lengths = {c.shape[0] for c in columns if c.ndim == 1}
+        if not lengths:
+            raise ValueError("precontract_batch() needs at least one array of values; "
+                             "use precontract() for a single set of values.")
+        if len(lengths) > 1:
+            raise ValueError(f"The arrays of fixed values have different lengths: {sorted(lengths)}.")
+        n_members = lengths.pop()
+        values = xp.stack([xp.broadcast_to(c, (n_members,)) for c in columns], axis=1)
+
+        _, a, b = self._table_on(xp)
+        tables, status = self._precontract_tables(xp, axes, values)
+        live = [i for i in range(self.ndim) if i not in axes]
+        batch = ChebyshevBatch(
+            tables, a[live], b[live],
+            axis_names=[self._axis_names[i] for i in live],
+            output_names=self._output_names,
+            domain_tol=self._domain_tol,
+        )
+        if return_status:
+            return batch, status
+        bad = status != 0
+        if bool(xp.any(bad)):
+            first = int(xp.flatnonzero(bad)[0])
+            x = np.full(self.ndim, np.nan)
+            x[axes] = to_numpy(values[first])
+            raise OutOfDomainError(
+                f"{int(bad.sum())} of {n_members} members have fixed values outside the interpolation "
+                f"domain; the first is member {first}: "
+                + self._domain_message(x, int(status[first])) + "."
+            )
+        return batch
+
+    def _precontract_tables(self, xp, axes, values, full=False):
+        """
+        Per-member tables with ``axes`` fixed at the rows of ``values``.
+
+        The table with the fixed axes moved to the front is cached per set of
+        axes (and device), so repeated precontractions skip the transpose.
+        This costs one extra copy of the table per set of axes in use.
+        """
+        key = (xp.__name__, tuple(axes), full)
+        if key not in self._fixed_first:
+            coeffs, a, b = (self._coeffs_full, self._a, self._b) if full else self._table_on(xp)
+            live = [i for i in range(self.ndim) if i not in axes]
+            order = list(axes) + live
+            table = xp.ascontiguousarray(xp.transpose(coeffs, order + [self.ndim]))
+            self._fixed_first[key] = (table, a[order], b[order])
+        table, a, b = self._fixed_first[key]
+        return precontract_tables(table, a, b, range(len(axes)), values,
+                                  tol=self._domain_tol, status_axes=axes)
+
+    def _resolve_fixed(self, fixed):
+        """Turn a mapping of axis name/index -> value into (axis indices, values)."""
+        if not hasattr(fixed, "items"):
+            raise TypeError("fixed must be a mapping from axis name (or index) to value.")
+        axes, values = [], []
+        for key, value in fixed.items():
+            ax = self._axis_position(key)
+            if ax in axes:
+                raise ValueError(f"Axis {self._axis_names[ax]!r} is fixed more than once.")
+            axes.append(ax)
+            values.append(value)
+        if not axes:
+            raise ValueError("fixed must name at least one axis.")
+        if len(axes) == self.ndim:
+            raise ValueError("Fixing every axis leaves nothing to interpolate; use evaluate() instead.")
+        return axes, values
+
+    def _axis_position(self, key):
+        """Index of the axis named `key`, or `key` itself if it is a valid integer index."""
+        if isinstance(key, str):
+            try:
+                return self._axis_names.index(key)
+            except ValueError:
+                raise KeyError(f"No axis named {key!r}; the axes are {self._axis_names}.") from None
+        if isinstance(key, numbers.Integral) and not isinstance(key, bool):
+            if not -self.ndim <= key < self.ndim:
+                raise KeyError(f"Axis index {key} out of range for {self.ndim} axes.")
+            return int(key) % self.ndim
+        raise TypeError(f"Axes are given by name or integer index, not {key!r}.")
 
     # ----------------------------------------------------- coefficients, errors
 

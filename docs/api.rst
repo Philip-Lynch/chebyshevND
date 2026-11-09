@@ -24,6 +24,10 @@ Interpolant classes
    :members:
    :special-members: __init__
 
+.. autoclass:: chebyshevnd.ChebyshevBatch
+   :members:
+   :special-members: __init__
+
 .. autoexception:: chebyshevnd.OutOfDomainError
 
 Batched evaluation (NumPy and CuPy)
@@ -32,6 +36,8 @@ Batched evaluation (NumPy and CuPy)
 .. autofunction:: chebyshevnd.evaluate_batch
 
 .. autofunction:: chebyshevnd.batched.chebyshev_basis_batch
+
+.. autofunction:: chebyshevnd.batched.precontract_tables
 
 Node generation
 ---------------

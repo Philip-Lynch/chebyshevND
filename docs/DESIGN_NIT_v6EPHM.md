@@ -1,15 +1,15 @@
 # ChebyshevND — design document for the NIT / SEOBNRv6EPHM extension
 
-**Revision:** 3.1 (2026-11-09).
-- Step 1 is implemented and merged into `dev`; §3 records what was built
-  and where it differs from the plan.
+**Revision:** 3.2 (2026-11-09).
+- Steps 1 and 2 are implemented; §3 records what was built and where it
+  differs from the plan.
 - GPU support with CUDA via CuPy is now a requirement (§0.3, A8, D6).
 - The second consumer is an interpolated post-Minkowskian (PM) Hamiltonian
   (§0.2).
 - Step 0 is complete (v0.1.1).
 - §9 lists all revisions and maps the old step numbers to the new ones.
 
-**Branch:** `dev` (v0.1.1 plus Step 1).
+**Branch:** `dev` (v0.1.1 plus Steps 1–2).
 
 **Purpose:** turn ChebyshevND from a 1D–4D single-function interpolator into the
 tabulation-and-evaluation backend for:
@@ -420,7 +420,10 @@ Sub-steps, each with its own tests:
   matches NumPy to 1e-13 relative.
 - Benchmark (not CI): the nD kernel is no slower than `clenshaw_4d` on 12⁴.
 
-### Step 2 — Precontraction over an arbitrary subset of axes
+### Step 2 — Precontraction over an arbitrary subset of axes — IMPLEMENTED
+
+Implemented on branch `step2-precontraction` (2026-11-09). "As built" below
+records where it differs from the design.
 
 **Why:** this is the biggest runtime lever. In the nonspinning model every
 axis but `(u, e)` is fixed per waveform; in the aligned-spin model `ν, χ₁, χ₂`
@@ -448,6 +451,45 @@ slowly). In a GPU batch, each member has its own fixed values.
   faster than the parent. For batches, prune once on the union over members,
   so the shape stays fixed.
 - `precompute_x` / `evaluate_yz(w)` become wrappers over 2a in Step 8.
+
+**As built** (differences from the design above):
+- **One routine for both.** `batched.precontract_tables` (NumPy/CuPy) does
+  the outer-product-plus-GEMM for 2b, and 2a calls it with a batch of one.
+  The per-axis `np.tensordot` planned for 2a was much slower on 5D tables
+  (3 ms per waveform), because every contraction on a non-leading axis
+  copies the whole tensor.
+- **Fixed axes first, cached.** Rather than reordering axes at load, the
+  table with a given set of fixed axes moved to the front is cached on
+  first use, per device. That costs one extra copy of the table per set
+  of fixed axes in use; `optimize` clears the cache.
+- **2a result:**
+  - an ordinary `ChebyshevInterpolantND` that evaluates exactly like the
+    parent, including its truncation;
+  - the full tensor is also contracted when the parent still holds it and
+    it differs from the truncated one, so the result can be optimized
+    again;
+  - the error estimate is inherited from the parent.
+- **2b result:** `precontract_batch(fixed, return_status=False)` returns
+  a `ChebyshevBatch` (new module `batch.py`).
+  - It holds the `(B, k…, F)` tables on their device, with
+    `evaluate(points, return_status=False)` taking one point per member.
+  - Scalars are allowed alongside arrays and apply to every member.
+  - Status bits for fixed values use the parent's axis numbering.
+  - No per-batch `optimize` yet: a batch inherits the parent's
+    truncation, which already keeps its shape fixed.
+- **Measured** (4 outputs, Apple laptop; `benchmarks/bench_evaluate.py`):
+
+  | Case | Full evaluate | `precontract` | Then evaluate | Batch build / member | Batch evaluate / member |
+  |---|---|---|---|---|---|
+  | nonspinning (ν, u, e) = 10×30×20, fix ν | 17–20 µs | 50 µs | 4.1 µs | 1–2 µs | 0.9 µs |
+  | aligned-spin (ν, u, e, χ₁, χ₂) = 10×24×16×6×6, fix ν, χ₁, χ₂ | 292 µs | 0.2–0.6 ms | 3.6 µs | 11 µs | 0.7 µs |
+
+  - Batch columns use B = 1000.
+  - The single-waveform `precontract` on the 5D table is limited by memory
+    bandwidth: one pass over the 4.4 MB table takes about 0.1 ms. It varies
+    with the laptop's cache state.
+- **GPU tests** (`pytest -m gpu`) are written but have not yet been run on a
+  CUDA machine.
 
 **Tests:**
 - Precontracted evaluation equals full evaluation to 1e-14 at random points,
@@ -812,7 +854,7 @@ These change details of 1e, 2b and 4b, not the plan's structure.
 |---|---|
 | 0 (done) | `interp3d.py`, `interp4d.py`, `clenshaw.py`, `utils.py`, `.github/workflows/tests.yml`, `benchmarks/`, README, docs, examples |
 | 1 (done) | new `kernels.py`, `interpnd.py`, `batched.py`, `backend.py`; `clenshaw.py` (`clenshaw_nd` on the kernel); `utils.py` (`axes=`); `__init__.py`; `docs/api.rst`; `benchmarks/bench_evaluate.py`; `pyproject.toml` (`gpu` extra and marker); tests `test_interpnd.py`, `test_batched.py`, `helpers.py` |
-| 2 | `interpnd.py` (`precontract`), `batched.py` (batched precontraction) |
+| 2 (done) | `interpnd.py` (`precontract`, `precontract_batch`), `batched.py` (`precontract_tables`), new `batch.py` (`ChebyshevBatch`), new `errors.py`; `docs/api.rst`; benchmarks; tests `test_precontract.py` |
 | 3 | new `derivatives.py`, `utils.py` (inverse DCT), `interpnd.py` (`derivative`, `values_at_nodes`, `check_derivatives`) |
 | 4 | `kernels.py` (`eval_into`, `eval_grad_into`), `batched.py` (`value_and_grad_batch`), new `cuda_kernels.py` (RawKernel sources, moved from Step 1), `interpnd.py` (`raw`, `value_and_grad`) |
 | 5 | 5a: new `maps.py` (Numba and `xp` versions, `eval_grad_physical_into`, `value_and_grad_physical_batch`), `interpnd.py` (`evaluate_physical`); 5b: new `grid.py` |
@@ -823,6 +865,14 @@ These change details of 1e, 2b and 4b, not the plan's structure.
 ---
 
 ## 9. Revision history
+
+**Revision 3.2 (2026-11-09).** Step 2 implemented (branch
+`step2-precontraction`). Step 2 now records how it was built and where it
+differs from the plan:
+- 2a uses 2b's single-GEMM routine with a batch of one;
+- the fixed-axes-first table is cached per set of axes;
+- `precontract_batch` returns a `ChebyshevBatch`;
+- measured timings.
 
 **Revision 3.1 (2026-11-09).** Step 1 implemented and merged into `dev`.
 Step 1 now records how it was built and where it differs from the plan:
