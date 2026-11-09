@@ -1,5 +1,6 @@
 """
-Per-call evaluation timings for the 1D-4D interpolants and ChebyshevInterpolantND.
+Per-call evaluation timings for the 1D-4D interpolants and ChebyshevInterpolantND,
+including precontraction.
 
 Run before and after a change to see its effect on evaluation cost:
 
@@ -51,6 +52,25 @@ ND_5D = (lambda a, b, c, d, e: np.exp(0.3 * a) * np.cos(0.5 * b) * (1 + 0.2 * c)
          * np.sin(0.4 * d + 0.1) * np.cos(e),
          [(0.0, 1.0), (-1.0, 2.0), (0.5, 1.5), (-2.0, -1.0), (0.0, 0.5)], (12, 10, 8, 8, 6))
 BATCH = 1000
+
+# Precontraction cases shaped like the NIT tables, with 4 outputs each:
+# (name, axis names, domains, node counts, axes fixed per waveform)
+PRECONTRACT_CASES = [
+    ("nonspinning", ("nu", "u", "e"), [(0.0, 0.25), (-3.0, -1.0), (0.0, 0.9)],
+     (10, 30, 20), ("nu",)),
+    ("aligned-spin", ("nu", "u", "e", "chi1", "chi2"),
+     [(0.0, 0.25), (-3.0, -1.0), (0.0, 0.9), (-1.0, 1.0), (-1.0, 1.0)],
+     (10, 24, 16, 6, 6), ("nu", "chi1", "chi2")),
+]
+
+
+def _nit_like(*xs, k=0):
+    """A smooth stand-in for an NIT forcing function; k varies the output."""
+    nu, u, e = xs[:3]
+    out = np.exp(-nu * (k + 1)) * np.cos(u + k) * (1 + e**2) ** (k + 1)
+    for j, chi in enumerate(xs[3:]):
+        out = out * (1 + 0.3 * (j + 1) * chi)
+    return out
 
 
 def time_us(fn, number=20000, repeat=5):
@@ -109,6 +129,32 @@ def run_nd():
     return results
 
 
+def run_precontract():
+    results = []
+    for name, axis_names, domains, Ns, fixed in PRECONTRACT_CASES:
+        axes = [chebyshev_nodes(N, a, b) for N, (a, b) in zip(Ns, domains)]
+        grids = np.meshgrid(*axes, indexing="ij")
+        vals = np.stack([_nit_like(*grids, k=k) for k in range(4)], axis=-1)
+        interp = ChebyshevInterpolantND(vals, domains, axis_names=axis_names, output_names=list("abcd"))
+        lo, hi = np.array(domains).T
+        points = np.random.default_rng(0).uniform(lo, hi, size=(BATCH, len(domains)))
+        fixed_idx = [axis_names.index(a) for a in fixed]
+        live_idx = [i for i in range(len(domains)) if i not in fixed_idx]
+        one = {a: points[0, i] for a, i in zip(fixed, fixed_idx)}
+        many = {a: points[:, i] for a, i in zip(fixed, fixed_idx)}
+
+        child = interp.precontract(one)
+        batch = interp.precontract_batch(many)
+        row = {"case": name, "grid": list(Ns), "fixed": list(fixed)}
+        row["evaluate_full_us"] = time_us(lambda: interp.evaluate(*points[0]), number=2000)
+        row["precontract_us"] = time_us(lambda: interp.precontract(one), number=200)
+        row["evaluate_precontracted_us"] = time_us(lambda: child.evaluate(*points[0, live_idx]))
+        row["precontract_batch_us_per_member"] = time_us(lambda: interp.precontract_batch(many), number=10) / BATCH
+        row["batch_evaluate_us_per_member"] = time_us(lambda: batch.evaluate(points[:, live_idx]), number=20) / BATCH
+        results.append(row)
+    return results
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[1])
     parser.add_argument("--json", help="also write the results to this JSON file")
@@ -116,6 +162,7 @@ def main():
 
     results = run()
     results_nd = run_nd()
+    results_pc = run_precontract()
     version = importlib.metadata.version("ChebyshevND")
     print(f"chebyshevnd {version} | numpy {np.__version__} | "
           f"scipy {scipy.__version__} | numba {numba.__version__} | "
@@ -137,6 +184,15 @@ def main():
               f"{r['batch_us_per_point']:8.2f}us {r['evaluate_optimized_us']:8.2f}us "
               f"{r['batch_optimized_us_per_point']:9.2f}us  {tuple(r['kmax_after_optimize'])}")
 
+    print(f"\nPrecontraction (4 outputs; batch columns: per member, B = {BATCH})")
+    print(f"{'case':<13} {'grid':<20} {'fixed':<17} {'full eval':>10} {'precontract':>12} "
+          f"{'then eval':>10} {'batch build':>12} {'batch eval':>11}")
+    for r in results_pc:
+        print(f"{r['case']:<13} {str(tuple(r['grid'])):<20} {','.join(r['fixed']):<17} "
+              f"{r['evaluate_full_us']:8.2f}us {r['precontract_us']:10.2f}us "
+              f"{r['evaluate_precontracted_us']:8.2f}us {r['precontract_batch_us_per_member']:10.2f}us "
+              f"{r['batch_evaluate_us_per_member']:9.2f}us")
+
     if args.json:
         meta = {
             "date": datetime.datetime.now().isoformat(timespec="seconds"),
@@ -149,7 +205,8 @@ def main():
             "numba": numba.__version__,
         }
         with open(args.json, "w") as fh:
-            json.dump({"meta": meta, "results": results, "results_nd": results_nd}, fh, indent=2)
+            json.dump({"meta": meta, "results": results, "results_nd": results_nd,
+                       "results_precontract": results_pc}, fh, indent=2)
         print(f"wrote {args.json}")
 
 
