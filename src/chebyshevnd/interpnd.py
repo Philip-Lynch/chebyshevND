@@ -8,6 +8,10 @@ from .utils import compute_chebyshev_coefficients_nd, prune_trailing_slices_gree
 _NODE_FAMILIES = ("Chebyshev", "GaussLobatto")
 
 
+class OutOfDomainError(ValueError):
+    """Raised when an interpolant is evaluated outside its domain."""
+
+
 class ChebyshevInterpolantND:
     """
     Chebyshev interpolant of a function of d variables on a box
@@ -27,7 +31,8 @@ class ChebyshevInterpolantND:
     must not be evaluated from several threads at once.
     """
 
-    def __init__(self, vals, domains, nodes="Chebyshev", axis_names=None, output_names=None):
+    def __init__(self, vals, domains, nodes="Chebyshev", axis_names=None, output_names=None,
+                 domain_tol=1e-12):
         """
         Construct an nD Chebyshev interpolant from values sampled on a tensor grid.
 
@@ -57,6 +62,12 @@ class ChebyshevInterpolantND:
             ``vals``. Giving it is what declares that axis: without it,
             ``vals`` must have exactly one axis per domain, so a missing
             domain cannot be mistaken for a function axis.
+        domain_tol : float, optional
+            How far outside its domain a coordinate may lie before
+            evaluation raises :class:`OutOfDomainError`, as a fraction of
+            the axis half-width (b - a) / 2. The default 1e-12 only absorbs
+            rounding at the boundaries: a Chebyshev series diverges quickly
+            outside its domain, so extrapolation is never silent.
         """
         vals = np.asarray(vals)
         # Two dtypes only (design doc A4): complex input stays complex
@@ -88,6 +99,10 @@ class ChebyshevInterpolantND:
                 f"got grid shape {grid_shape}."
             )
 
+        domain_tol = float(domain_tol)
+        if not domain_tol >= 0.0:
+            raise ValueError(f"domain_tol must be non-negative, got {domain_tol}.")
+        self._domain_tol = domain_tol
         self._a, self._b = a, b
         self._nodes = nodes
         self._axis_names = _parse_names(axis_names, d, "x", "axis_names")
@@ -175,6 +190,11 @@ class ChebyshevInterpolantND:
         return self._coeffs.dtype
 
     @property
+    def domain_tol(self):
+        """Allowed overshoot outside the domain, as a fraction of the half-width."""
+        return self._domain_tol
+
+    @property
     def nodes(self):
         """Node family the values were sampled at."""
         return self._nodes
@@ -195,11 +215,27 @@ class ChebyshevInterpolantND:
         float, complex or np.ndarray
             For a single function, its value (complex for complex values).
             With a function axis, an array of shape (F,).
+
+        Raises
+        ------
+        OutOfDomainError
+            If a coordinate lies outside its domain (beyond ``domain_tol``)
+            or is NaN.
         """
         x = self._point(xs)
-        evaluate_point(self._flat, self._shape, self._a, self._b, x, self._ts,
-                       self._basis, self._work_a, self._work_b, self._out)
+        status = evaluate_point(self._flat, self._shape, self._a, self._b, x, self._domain_tol,
+                                self._ts, self._basis, self._work_a, self._work_b, self._out)
+        if status:
+            raise OutOfDomainError(self._domain_message(x, status))
         return self._result(self._out)
+
+    def _domain_message(self, x, status):
+        """Describe which coordinates of `x` are outside the domain, from a status bitmask."""
+        bad = [
+            f"{self._axis_names[i]} = {float(x[i])!r} not in [{float(self._a[i])!r}, {float(self._b[i])!r}]"
+            for i in range(self.ndim) if status >> i & 1
+        ]
+        return "Point outside the interpolation domain: " + "; ".join(bad) + "."
 
     def _result(self, out):
         """Return the scalar for a single function, otherwise a copy of the array."""

@@ -70,14 +70,28 @@ def contract(coeffs, shape, ts, basis, work_a, work_b, out):
 
 
 @njit(cache=True)
-def evaluate_point(coeffs, shape, a, b, xs, ts, basis, work_a, work_b, out):
+def evaluate_point(coeffs, shape, a, b, xs, tol, ts, basis, work_a, work_b, out):
     """
     Map ``xs`` from the box [a, b] to [-1, 1]^d and evaluate the table there.
 
     ``ts`` is scratch space of length d; the other arguments are as for
     :func:`contract`.
+
+    Returns
+    -------
+    int
+        Status bitmask: bit i is set when coordinate i lies outside its
+        domain by more than ``tol`` (in units of the half-width), or is NaN.
+        0 means the point is inside the domain. The output is computed
+        either way (it extrapolates outside the domain); it is up to the
+        caller to act on the status.
     """
     d = shape.shape[0]
+    status = 0
     for i in range(d):
-        ts[i] = (2.0 * xs[i] - a[i] - b[i]) / (b[i] - a[i])
+        t = (2.0 * xs[i] - a[i] - b[i]) / (b[i] - a[i])
+        if not abs(t) <= 1.0 + tol:
+            status |= 1 << i
+        ts[i] = t
     contract(coeffs, shape, ts, basis, work_a, work_b, out)
+    return status

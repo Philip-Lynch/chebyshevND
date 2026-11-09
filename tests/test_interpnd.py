@@ -374,3 +374,54 @@ def test_gauss_lobatto_multi_output_checks_only_grid_axes():
     for p in random_points(MULTI_DOMAINS, 5):
         assert nd.evaluate(*p)[0] == pytest.approx(single.evaluate(*p), rel=1e-15)
         assert nd.evaluate(*p)[0] == pytest.approx(MULTI_FUNCS["wave"](*p), abs=1e-10)
+
+
+# -------------------------------------------------------------- domain checks
+
+def test_out_of_domain_raises_and_names_the_axis():
+    from chebyshevnd import OutOfDomainError
+    _, domains, _, vals, _ = build(3)
+    nd = ChebyshevInterpolantND(vals, domains, axis_names=("nu", "u", "e"))
+    with pytest.raises(OutOfDomainError, match="u = 3.5") as info:
+        nd.evaluate(1.0, 3.5, 2.0)
+    assert isinstance(info.value, ValueError)
+    assert "nu" not in str(info.value) and "e =" not in str(info.value)
+
+
+def test_out_of_domain_reports_every_bad_axis():
+    from chebyshevnd import OutOfDomainError
+    _, domains, _, _, nd = build(3)
+    with pytest.raises(OutOfDomainError, match="x0 .*x2"):
+        nd.evaluate(-1.0, 0.5, 9.0)
+
+
+def test_boundaries_and_tolerance():
+    from chebyshevnd import OutOfDomainError
+    _, domains, _, _, nd = build(2)
+    (ax, bx), (ay, by) = domains
+    for x, y in [(ax, ay), (bx, by), (ax, by), (bx, ay)]:
+        nd.evaluate(x, y)  # exact boundaries are inside
+    half_width = (bx - ax) / 2
+    nd.evaluate(bx + 0.5e-12 * half_width, ay)  # within the default tolerance
+    with pytest.raises(OutOfDomainError):
+        nd.evaluate(bx + 1e-9 * half_width, ay)
+
+
+def test_custom_domain_tolerance():
+    from chebyshevnd import OutOfDomainError
+    _, domains, _, vals, _ = build(2)
+    nd = ChebyshevInterpolantND(vals, domains, domain_tol=0.1)
+    assert nd.domain_tol == 0.1
+    (ax, bx), (ay, by) = domains
+    nd.evaluate(bx + 0.05 * (bx - ax) / 2, ay)
+    with pytest.raises(OutOfDomainError):
+        nd.evaluate(bx + 0.2 * (bx - ax) / 2, ay)
+    with pytest.raises(ValueError):
+        ChebyshevInterpolantND(vals, domains, domain_tol=-1.0)
+
+
+def test_nan_coordinate_is_out_of_domain():
+    from chebyshevnd import OutOfDomainError
+    _, _, _, _, nd = build(2)
+    with pytest.raises(OutOfDomainError, match="nan"):
+        nd.evaluate(np.nan, 1.0)

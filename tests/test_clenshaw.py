@@ -159,3 +159,10 @@ def test_clenshaw_nd_complex_coefficients(rng):
     got = clenshaw_nd(coeffs, ts)
     assert type(got) is complex
     assert got == pytest.approx(direct_eval(coeffs, ts), rel=1e-12, abs=1e-14)
+
+
+def test_clenshaw_nd_still_extrapolates_without_checking(rng):
+    # The standalone kernel keeps v0.1 behaviour: no domain check
+    coeffs = decaying_coeffs(rng, (4, 3))
+    ts = np.array([1.5, -0.2])
+    assert clenshaw_nd(coeffs, ts) == pytest.approx(npcheb.chebval2d(1.5, -0.2, coeffs), rel=1e-12)
