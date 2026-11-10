@@ -30,10 +30,29 @@ Interpolant classes
 
 .. autoexception:: chebyshevnd.OutOfDomainError
 
+Evaluation from compiled code (Numba)
+-------------------------------------
+
+For an ODE right-hand side written with Numba: get the table's arrays with
+:meth:`ChebyshevInterpolantND.raw <chebyshevnd.ChebyshevInterpolantND.raw>`,
+a workspace with :meth:`RawTable.workspace <chebyshevnd.RawTable.workspace>`,
+and evaluate inside ``@njit`` code with these functions.
+
+.. autofunction:: chebyshevnd.eval_into
+
+.. autofunction:: chebyshevnd.eval_grad_into
+
+.. autoclass:: chebyshevnd.RawTable
+   :members: ndim, n_outputs, dtype, workspace
+
+.. autoclass:: chebyshevnd.Workspace
+
 Batched evaluation (NumPy and CuPy)
 -----------------------------------
 
 .. autofunction:: chebyshevnd.evaluate_batch
+
+.. autofunction:: chebyshevnd.value_and_grad_batch
 
 .. autofunction:: chebyshevnd.batched.chebyshev_basis_batch
 
