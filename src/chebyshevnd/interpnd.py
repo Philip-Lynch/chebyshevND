@@ -1014,9 +1014,48 @@ class ChebyshevInterpolantND:
         float or np.ndarray
             Absolute error estimate; an array of shape (F,), one per
             function, when there is a function axis.
+
+        See Also
+        --------
+        error_by_axis : the estimate split by axis.
         """
         err = self._interp_error + self._discarded
         return float(err[0]) if self._single else err
+
+    def error_by_axis(self, relative=False):
+        """
+        The trailing-coefficient error estimate, axis by axis.
+
+        Shows which axis limits the accuracy, e.g. to choose the number of
+        nodes per axis: an axis with an estimate far below the others can
+        have fewer nodes, and the axis with the largest one needs more. The
+        interpolation part of :meth:`absolute_error` is the largest entry
+        (for an interpolant built from samples).
+
+        The estimate is conservative on an axis where the function is an
+        exact polynomial with only one or two nodes to spare: e.g. a
+        quadratic sampled at 3 nodes, or an even quadratic at 4. Its top
+        genuine coefficients then sit in the last slices and are reported
+        as error. One or two more nodes on that axis show whether the
+        series has really ended.
+
+        Parameters
+        ----------
+        relative : bool, optional
+            Divide by the largest coefficient magnitude of each function.
+
+        Returns
+        -------
+        np.ndarray
+            Shape (d,) for a single function, (d, F) with a function axis.
+            Computed from the full coefficient tensor if it is held,
+            otherwise from the truncated one.
+        """
+        coeffs = self._coeffs_full if self._coeffs_full is not None else self._coeffs
+        err = _trailing_errors_by_axis(np.abs(coeffs))
+        if relative:
+            err = np.where(self._scale > 0, err / np.where(self._scale > 0, self._scale, 1.0), 0.0)
+        return err[:, 0] if self._single else err
 
     def relative_error(self):
         """
@@ -1155,22 +1194,32 @@ def _parse_names(names, count, prefix, argname):
 
 def _trailing_error_estimate(abs_c):
     """
-    Per-output error estimate from the trailing coefficients along each axis.
+    Per-output error estimate from the trailing coefficients: the largest
+    of :func:`_trailing_errors_by_axis` over the axes.
+    """
+    return _trailing_errors_by_axis(abs_c).max(axis=0, initial=0.0)
 
-    ``abs_c`` has shape (N_1, ..., N_d, F). For every axis with at least two
-    coefficients, the last and second-to-last slices are scaled by N and
-    N - 1 respectively (the convention of the 2D-4D classes), and the
-    largest result over all axes is taken.
+
+def _trailing_errors_by_axis(abs_c):
+    """
+    Per-axis, per-output error estimates from the trailing coefficients.
+
+    ``abs_c`` has shape (N_1, ..., N_d, F); the result has shape (d, F).
+    Along each axis, take the largest magnitude in each slice; ignoring
+    trailing slices that are exactly zero (a derivative's top
+    coefficients), the last and second-to-last are scaled by the number of
+    remaining slices n and by n - 1 (the convention of the 2D-4D classes),
+    and the larger is the estimate. An axis with a single nonzero slice
+    contributes 0.
     """
     d = abs_c.ndim - 1
     n_out = abs_c.shape[-1]
-    err = np.zeros(n_out)
+    err = np.zeros((d, n_out))
     for ax in range(d):
-        n = abs_c.shape[ax]
-        if n < 2:
-            continue
-        c = np.moveaxis(abs_c, ax, 0)
-        last = c[-1].reshape(-1, n_out).max(axis=0) * n
-        second = c[-2].reshape(-1, n_out).max(axis=0) * (n - 1)
-        err = np.maximum(err, np.maximum(last, second))
+        slices = np.moveaxis(abs_c, ax, 0).reshape(abs_c.shape[ax], -1, n_out).max(axis=1)
+        for f in range(n_out):
+            nonzero = np.flatnonzero(slices[:, f])
+            n = nonzero[-1] + 1 if nonzero.size else 0
+            if n >= 2:
+                err[ax, f] = max(slices[n - 1, f] * n, slices[n - 2, f] * (n - 1))
     return err
