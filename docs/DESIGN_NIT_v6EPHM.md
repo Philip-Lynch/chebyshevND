@@ -1,7 +1,7 @@
 # ChebyshevND — design document for the NIT / SEOBNRv6EPHM extension
 
-**Revision:** 3.4 (2026-11-10).
-- Steps 1–4 are implemented; §3 records what was built and where it
+**Revision:** 3.5 (2026-11-10).
+- Steps 1–5 are implemented; §3 records what was built and where it
   differs from the plan.
 - GPU support with CUDA via CuPy is now a requirement (§0.3, A8, D6).
 - The second consumer is an interpolated post-Minkowskian (PM) Hamiltonian
@@ -9,7 +9,7 @@
 - Step 0 is complete (v0.1.1).
 - §9 lists all revisions and maps the old step numbers to the new ones.
 
-**Branch:** `dev` (v0.1.1 plus Steps 1–4).
+**Branch:** `dev` (v0.1.1 plus Steps 1–5).
 
 **Purpose:** turn ChebyshevND from a 1D–4D single-function interpolator into the
 tabulation-and-evaluation backend for:
@@ -756,7 +756,10 @@ Cython/C port cheap as well, if plans change.
   - for the PM Hamiltonian, a comparison with the analytic Hamiltonian
     batched on the same GPU.
 
-### Step 5 — Domain maps, grid definition and sampling workflow
+### Step 5 — Domain maps, grid definition and sampling workflow — IMPLEMENTED
+
+Implemented on branch `step5-maps-grid` (2026-11-10). "As built" below
+records where it differs from the design.
 
 **Why grouped:** the map decides where the nodes sit in physical variables,
 so the grid and the maps are one design.
@@ -829,6 +832,102 @@ evaluation stack is done (D3), so this step follows Step 4.
 - Grid order matches `meshgrid(..., indexing='ij')`.
 - `chunks → merge → from_samples` equals a direct fit.
 - Out-of-domain detection in physical variables.
+
+**As built, 5a** (differences from the design above):
+- **One parametrised map instead of a registry of map types.** Every axis
+  has `y = f((x − L)/W)`.
+  - The transform f is `identity`, `log(s + offset)` or
+    `(s + offset)^power`.
+  - L is a constant or a boundary function.
+  - W is a width, or `upper − L`; each is a constant or a boundary
+    function.
+
+  This covers the planned set (affine; log-type; affine between a
+  boundary table and a fixed upper bound). It also covers `u = 1/r`
+  (`power = −1`), which §0.2 needs but the initial set lacked; momenta
+  relative to an `r`-dependent reference; and the log of the distance to
+  a separatrix. Every map is still written twice (Numba and `xp`), but as
+  one function with three transforms.
+- **One boundary table per interpolant.** It is a real
+  `ChebyshevInterpolantND` whose named outputs are the boundary functions,
+  and maps refer to those outputs by name. The kernels therefore take a
+  fixed number of arrays, and one multi-output table costs little more
+  than one function. The restriction is that all boundary functions share
+  one grid over the same inputs.
+- **One level of dependence.** The boundary table's inputs must be axes
+  with constant windows. The physical↔table conversion then takes one pass,
+  and the Jacobian is diagonal apart from the boundary inputs' columns,
+  which the Numba kernel exploits to apply the chain rule in place.
+  Constructing an interpolant checks that the boundary table covers the
+  physical range of its inputs.
+- **Domains are in table coordinates.** `AxisMap.table_domain(lo, hi)`
+  converts a physical interval for maps with constant windows.
+- **Maps live in a wrapper class, `MappedInterpolant`** (new `mapped.py`),
+  not in `ChebyshevInterpolantND`. Every method of the wrapper takes
+  physical coordinates, and every method of `ChebyshevInterpolantND` stays
+  in table coordinates, so `evaluate_physical` is
+  `MappedInterpolant.evaluate`.
+  - Single points: `evaluate`, `value_and_grad`.
+  - Batches: `evaluate_batch`, `value_and_grad_batch`, and
+    `value_grad_hess_batch` (build time: Step 3's derivative tables plus
+    the map Hessian).
+  - Coordinate changes: `to_table`, `to_physical`.
+  - Precontraction: `precontract`, and `precontract_batch`, which returns a
+    `MappedBatch`.
+  - `raw()` returns a `RawMappedTable` for the Numba entry points
+    `eval_physical_into` / `eval_grad_physical_into` (14 flat arguments;
+    see Step 4 on why arguments are flat). The batched `xp` path is
+    `MappedInterpolant.value_and_grad_batch`; there is no separate
+    module-level `value_and_grad_physical_batch`.
+- **Status and errors.** Bit i is set when axis i's table coordinate is
+  outside the domain or NaN (an undefined map, e.g. the log of a negative
+  number), or when coordinate i is outside the boundary table's domain.
+  Messages are in physical terms, e.g. "p = 3.1 maps to 0.53, outside the
+  table domain [−0.5, 0.5]".
+- **Precontraction** maps the fixed values to table coordinates first.
+  - If all of the boundary's inputs are fixed, the boundary functions
+    become numbers bound into the remaining maps (one per member in a
+    batch).
+  - If only some are fixed, the boundary table is precontracted too.
+  - An axis whose map uses the boundary can only be fixed together with
+    all of the boundary's inputs.
+- **Measured** on a PM-like (r, p_r, p_φ) = 30×8×10 table, value +
+  gradient:
+
+  | Variant | Raw kernel | Python `value_and_grad` | Batch, per point |
+  |---|---|---|---|
+  | unmapped | 2.06 µs | 3.7 µs | 1.1–1.3 µs |
+  | u = 1/r | 2.23 µs | 4.7 µs | 1.2–1.4 µs |
+  | u = 1/r, p_φ − ref(r) (boundary table) | 2.40 µs | 4.8 µs | 1.5 µs |
+
+  On the compiled path the maps cost 0.2–0.35 µs.
+- **Accuracy.** A 4D fixture with every kind of map (26×14×10×16, with
+  boundary functions of two axes) matches the analytic function to 4e-13,
+  its physical gradient to 4e-11 and its physical Hessian to 1.4e-9. The
+  Kepler test of Step 4, rebuilt with `u = 1/r` and `p_φ` relative to a
+  boundary `√r`, conserves energy to 7e-13 and follows the orbit to 5e-12.
+- **GPU tests** (2) are written and have not been run.
+
+**As built, 5b:**
+- **Grid.** `Axis(name, n, domain, map=None)` and
+  `ChebyshevGrid(axes, nodes="Chebyshev", boundary=None)`.
+  - The node family belongs to the grid, not to each axis, because an
+    interpolant has a single family.
+  - The grid provides `table_nodes()`, `table_points(start, stop)`,
+    `physical_points(start, stop)` (the points to sample at),
+    `multi_index` / `linear_index`, `chunks(size)` and `grid_hash()`.
+- **`from_samples` became `grid.fit(values)`.** It returns a
+  `MappedInterpolant` if any axis is mapped, otherwise the plain table.
+- **Checkpoints.**
+  - `grid.save_chunk(path, start, stop, values)` writes one `.npz` per
+    chunk.
+  - `grid.load_chunks(paths)` (the planned `merge`) checks the hash, full
+    coverage, overlaps and that every chunk holds the same functions.
+- **`grid_hash()`** covers the node family, the axes (names, node counts,
+  domains, maps) and the boundary table's exact coefficient bytes. Build
+  the boundary table once and give every worker the same one: rebuilding
+  it on a machine whose arithmetic differs in the last bit changes the
+  hash.
 
 ### Step 6 — Serialization and metadata
 
@@ -1011,7 +1110,7 @@ These change details of 1e, 2b and 4b, not the plan's structure.
 | 2 (done) | `interpnd.py` (`precontract`, `precontract_batch`), `batched.py` (`precontract_tables`), new `batch.py` (`ChebyshevBatch`), new `errors.py`; `docs/api.rst`; benchmarks; tests `test_precontract.py` |
 | 3 (done) | new `derivatives.py` (`differentiate_coefficients`); `utils.py` (`chebyshev_values_at_nodes_nd`); `interpnd.py` (`derivative`, `values_at_nodes`, `axis_nodes`, `check_derivatives`); `docs/api.rst`; tests `test_derivatives.py` |
 | 4 (done) | `kernels.py` (`value_and_grad_point`, `eval_into`, `eval_grad_into`, `RawTable`, `Workspace`), `batched.py` (`value_and_grad_batch`, basis rewrite), `batch.py` (`value_and_grad`), `interpnd.py` (`raw`, `value_and_grad`, `value_and_grad_batch`); `docs/api.rst`; benchmarks; tests `test_fused.py`. `cuda_kernels.py` (RawKernel) deferred to the GPU follow-up |
-| 5 | 5a: new `maps.py` (Numba and `xp` versions, `eval_grad_physical_into`, `value_and_grad_physical_batch`), `interpnd.py` (`evaluate_physical`); 5b: new `grid.py` |
+| 5 (done) | 5a: new `maps.py` (`AxisMap`, packing, `xp` and Numba maps, `eval_physical_into`, `eval_grad_physical_into`, `RawMappedTable`), new `mapped.py` (`MappedInterpolant`, `MappedBatch`), `interpnd.py` (shared per-member value stacking); 5b: new `grid.py` (`Axis`, `ChebyshevGrid`); `docs/api.rst`, `docs/conf.py`; benchmarks; tests `test_mapped.py`, `test_grid.py` |
 | 6 | new `io.py` (with device placement), `pyproject.toml` (`io` extra) |
 | 7 | new `prefactors.py` |
 | 8 | `interp1d–4d.py`, README, `docs/api.rst`, examples, benchmarks |
@@ -1019,6 +1118,17 @@ These change details of 1e, 2b and 4b, not the plan's structure.
 ---
 
 ## 9. Revision history
+
+**Revision 3.5 (2026-11-10).** Step 5 implemented (branch `step5-maps-grid`).
+Step 5 now records how it was built and where it differs from the plan:
+- one parametrised map per axis, with boundary functions from a single
+  boundary table;
+- one level of dependence;
+- the `MappedInterpolant` wrapper instead of `evaluate_physical` on the
+  nD class;
+- `grid.fit` / `save_chunk` / `load_chunks`;
+- a node family per grid rather than per axis;
+- measured costs and accuracy.
 
 **Revision 3.4 (2026-11-10).** Step 4 implemented (branch
 `step4-fused-evaluation`). Step 4 now records how it was built and where it

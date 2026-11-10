@@ -28,6 +28,33 @@ Interpolant classes
    :members:
    :special-members: __init__
 
+Physical coordinates: domain maps
+---------------------------------
+
+A :class:`~chebyshevnd.MappedInterpolant` evaluates a table in physical
+coordinates, through one :class:`~chebyshevnd.AxisMap` per axis, so a table
+can cover a region that is not a box (e.g. above a separatrix, or around a
+reference value that depends on another coordinate).
+
+.. autoclass:: chebyshevnd.AxisMap
+   :members:
+   :special-members: __init__
+
+.. autoclass:: chebyshevnd.MappedInterpolant
+   :members:
+   :special-members: __init__
+
+.. autoclass:: chebyshevnd.MappedBatch
+   :members:
+
+Grids and sampling
+------------------
+
+.. autoclass:: chebyshevnd.Axis
+
+.. autoclass:: chebyshevnd.ChebyshevGrid
+   :members:
+
 .. autoexception:: chebyshevnd.OutOfDomainError
 
 Evaluation from compiled code (Numba)
@@ -46,6 +73,13 @@ and evaluate inside ``@njit`` code with these functions.
    :members: ndim, n_outputs, dtype, workspace
 
 .. autoclass:: chebyshevnd.Workspace
+
+.. autofunction:: chebyshevnd.eval_physical_into
+
+.. autofunction:: chebyshevnd.eval_grad_physical_into
+
+.. autoclass:: chebyshevnd.RawMappedTable
+   :members: ndim, n_outputs, dtype, workspace
 
 Batched evaluation (NumPy and CuPy)
 -----------------------------------
