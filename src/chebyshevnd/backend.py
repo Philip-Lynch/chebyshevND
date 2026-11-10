@@ -24,6 +24,32 @@ def array_namespace(*arrays):
     return np
 
 
+def resolve_device(device):
+    """
+    The array module for a device name.
+
+    Parameters
+    ----------
+    device : {"cpu", "cuda"}
+        "cpu" (also "numpy") or "cuda" (also "gpu", "cupy", meaning CuPy's
+        current device).
+
+    Returns
+    -------
+    module
+        ``numpy`` or ``cupy``.
+    """
+    if device in ("cpu", "numpy"):
+        return np
+    if device in ("cuda", "gpu", "cupy"):
+        try:
+            import cupy
+        except ImportError:
+            raise ImportError(f"device={device!r} needs CuPy: pip install chebyshevnd[gpu]") from None
+        return cupy
+    raise ValueError(f"device must be 'cpu' or 'cuda', got {device!r}.")
+
+
 def to_numpy(x):
     """Return ``x`` as a NumPy array, copying it from the GPU if it is a CuPy array."""
     if _is_cupy(x):

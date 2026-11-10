@@ -47,6 +47,19 @@ reference value that depends on another coordinate).
 .. autoclass:: chebyshevnd.MappedBatch
    :members:
 
+Saving and loading
+------------------
+
+Tables and grids are stored in HDF5 (needs ``h5py``:
+``pip install chebyshevnd[io]``); the layout is described in
+:doc:`file_format`.
+
+.. autofunction:: chebyshevnd.save
+
+.. autofunction:: chebyshevnd.load
+
+.. autofunction:: chebyshevnd.read_metadata
+
 Grids and sampling
 ------------------
 

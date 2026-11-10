@@ -2,7 +2,7 @@
 
 import numpy as np
 
-from .backend import array_namespace, to_numpy
+from .backend import array_namespace, resolve_device, to_numpy
 from .batched import evaluate_batch as _evaluate_batch
 from .batched import value_and_grad_batch as _value_and_grad_batch
 from .errors import OutOfDomainError
@@ -535,6 +535,25 @@ class MappedInterpolant:
         outside = ~(xp.abs(t) <= 1.0 + self.domain_tol)
         weights = xp.asarray([1 << ax for ax in axes], dtype=xp.int64)
         return y, bvals, bits | (outside * weights).sum(axis=1)
+
+    def to_device(self, device="cuda"):
+        """
+        Copy the table, the boundary table and the maps to a device now.
+
+        Parameters
+        ----------
+        device : {"cuda", "cpu"}
+            "cuda" copies to CuPy's current device; "cpu" does nothing.
+
+        Returns
+        -------
+        MappedInterpolant
+            This interpolant.
+        """
+        xp = resolve_device(device)
+        if xp is not np:
+            self._on(xp)
+        return self
 
     # -------------------------------------------------------------- helpers
 

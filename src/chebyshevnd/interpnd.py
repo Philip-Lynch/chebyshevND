@@ -4,7 +4,7 @@ import numbers
 
 import numpy as np
 
-from .backend import array_namespace, to_numpy
+from .backend import array_namespace, resolve_device, to_numpy
 from .batch import ChebyshevBatch
 from .batched import precontract_tables
 from .batched import evaluate_batch as _evaluate_batch
@@ -148,15 +148,18 @@ class ChebyshevInterpolantND:
 
     @classmethod
     def _from_tables(cls, coeffs, coeffs_full, a, b, *, nodes, axis_names, output_names,
-                     domain_tol, abs_error, grid_shape):
+                     domain_tol, abs_error, grid_shape, discarded=None, scale=None):
         """
         Build an interpolant directly from coefficient tensors, e.g. the result
-        of a precontraction.
+        of a precontraction, or a table read from a file.
 
         ``coeffs`` (the evaluation tensor) and ``coeffs_full`` (or None) carry
         a trailing output axis. ``output_names`` is empty for a single
         function. ``abs_error`` (one value per output) becomes the error
         estimate: it is inherited from the parent, whose bound still holds.
+        ``discarded`` (the truncation part of the estimate, default zero) and
+        ``scale`` (the largest coefficient magnitude per output, default
+        computed from the coefficients) restore a saved table exactly.
         """
         self = cls.__new__(cls)
         self._single = len(output_names) == 0
@@ -171,9 +174,10 @@ class ChebyshevInterpolantND:
         self._coeffs_full = None if coeffs_full is None else np.ascontiguousarray(coeffs_full)
         reference = coeffs if coeffs_full is None else coeffs_full
         n_out = reference.shape[-1]
-        self._scale = np.abs(reference).reshape(-1, n_out).max(axis=0)
+        self._scale = (np.abs(reference).reshape(-1, n_out).max(axis=0) if scale is None
+                       else np.array(scale, dtype=np.float64))
         self._interp_error = np.array(abs_error, dtype=np.float64)
-        self._discarded = np.zeros(n_out)
+        self._discarded = np.zeros(n_out) if discarded is None else np.array(discarded, dtype=np.float64)
         self._x = np.empty(self._a.shape[0])
         self._set_compact(coeffs)
         return self
@@ -489,6 +493,29 @@ class ChebyshevInterpolantND:
                 f"the first is point {first}: "
                 + self._domain_message(to_numpy(pts[first]), int(status[first])) + "."
             )
+
+    def to_device(self, device="cuda"):
+        """
+        Copy the table to a device now, rather than on first use there.
+
+        The interpolant always keeps its coefficients on the host (for
+        :meth:`evaluate` and Numba). This copies them to the GPU once, so
+        that the first batched call from an ODE loop does not pay for it.
+
+        Parameters
+        ----------
+        device : {"cuda", "cpu"}
+            "cuda" copies to CuPy's current device; "cpu" does nothing.
+
+        Returns
+        -------
+        ChebyshevInterpolantND
+            This interpolant.
+        """
+        xp = resolve_device(device)
+        if xp is not np:
+            self._table_on(xp)
+        return self
 
     def _table_on(self, xp):
         """The compact coefficients and bounds as arrays of module `xp`, cached per device."""
