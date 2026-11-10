@@ -17,6 +17,7 @@ from .kernels import RawTable, Workspace, eval_grad_into, eval_into
 from .maps import AxisMap, RawMappedTable, eval_grad_physical_into, eval_physical_into
 from .mapped import MappedBatch, MappedInterpolant
 from .grid import Axis, ChebyshevGrid
+from .io import load, read_metadata, save
 
 # Clenshaw evaluation kernels
 from .clenshaw import(clenshaw_1d,
@@ -61,6 +62,9 @@ __all__ = [
     "eval_grad_physical_into",
     "Axis",
     "ChebyshevGrid",
+    "save",
+    "load",
+    "read_metadata",
     "differentiate_coefficients",
     "clenshaw_1d",
     "clenshaw_2d",

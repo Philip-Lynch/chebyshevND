@@ -45,6 +45,8 @@ test = ["pytest"]
 docs = ["sphinx", "furo", "myst-nb"]
 # Batched evaluation on NVIDIA GPUs (CUDA 12)
 gpu = ["cupy-cuda12x"]
+# Saving and loading tables (HDF5)
+io = ["h5py"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
