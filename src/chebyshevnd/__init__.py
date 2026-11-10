@@ -14,6 +14,9 @@ from .batch import ChebyshevBatch
 from .batched import evaluate_batch, value_and_grad_batch
 from .derivatives import differentiate_coefficients
 from .kernels import RawTable, Workspace, eval_grad_into, eval_into
+from .maps import AxisMap, RawMappedTable, eval_grad_physical_into, eval_physical_into
+from .mapped import MappedBatch, MappedInterpolant
+from .grid import Axis, ChebyshevGrid
 
 # Clenshaw evaluation kernels
 from .clenshaw import(clenshaw_1d,
@@ -50,6 +53,14 @@ __all__ = [
     "Workspace",
     "eval_into",
     "eval_grad_into",
+    "AxisMap",
+    "MappedInterpolant",
+    "MappedBatch",
+    "RawMappedTable",
+    "eval_physical_into",
+    "eval_grad_physical_into",
+    "Axis",
+    "ChebyshevGrid",
     "differentiate_coefficients",
     "clenshaw_1d",
     "clenshaw_2d",

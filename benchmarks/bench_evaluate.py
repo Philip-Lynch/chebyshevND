@@ -8,6 +8,11 @@ Run before and after a change to see its effect on evaluation cost:
     python benchmarks/bench_evaluate.py --json results.json
     python benchmarks/bench_evaluate.py --gpu   # adds a CuPy batch-size sweep
 
+Sections: the v0.1 classes; ChebyshevInterpolantND (single points, batches);
+precontraction; value vs value + gradient; an ODE right-hand side; a
+batch-size sweep; domain maps (the cost of evaluating in physical
+coordinates).
+
 Timings are the best of several repeats, in microseconds per call, and
 include the Python-level call overhead a user sees. They depend on the
 machine, so compare runs from the same machine only.
@@ -27,6 +32,9 @@ from numba import njit
 from scipy.integrate import solve_ivp
 
 from chebyshevnd import (
+    Axis,
+    AxisMap,
+    ChebyshevGrid,
     ChebyshevInterpolant1D,
     ChebyshevInterpolant2D,
     ChebyshevInterpolant3D,
@@ -34,6 +42,7 @@ from chebyshevnd import (
     ChebyshevInterpolantND,
     chebyshev_nodes,
     eval_grad_into,
+    eval_grad_physical_into,
     eval_into,
 )
 
@@ -304,6 +313,61 @@ def run_batch_sweep(xp):
     return results
 
 
+@njit
+def _loop_grad_physical(points, coeffs, shape, bounds, tol, codes, params, bcoeffs, bshape,
+                        bbounds, baxes, scratch, work, out):
+    status = 0
+    for i in range(points.shape[0]):
+        status |= eval_grad_physical_into(coeffs, shape, bounds, tol, codes, params, bcoeffs,
+                                          bshape, bbounds, baxes, points[i], scratch, work, out)
+    return status
+
+
+def run_maps():
+    """
+    Cost of evaluating in physical coordinates, on a PM-Hamiltonian-like
+    (r, p_r, p_phi) table of 30 x 8 x 10 coefficients: unmapped, with
+    u = 1/r, and with u = 1/r plus p_phi relative to a boundary function of r.
+    """
+    r_range = (6.0, 16.0)
+    inv = AxisMap("power", power=-1)
+    rn = chebyshev_nodes(20, *r_range)
+    boundary = ChebyshevInterpolantND(np.sqrt(rn)[:, None], [r_range], axis_names=["r"],
+                                      output_names=["pphi_circ"])
+    variants = {
+        "unmapped": ChebyshevGrid([Axis("r", 30, r_range), Axis("pr", 8, (-0.15, 0.15)),
+                                   Axis("pphi", 10, (2.0, 4.5))]),
+        "u = 1/r": ChebyshevGrid([Axis("r", 30, inv.table_domain(*r_range), inv),
+                                  Axis("pr", 8, (-0.15, 0.15)), Axis("pphi", 10, (2.0, 4.5))]),
+        "u = 1/r, p_phi - ref(r)": ChebyshevGrid(
+            [Axis("r", 30, inv.table_domain(*r_range), inv), Axis("pr", 8, (-0.15, 0.15)),
+             Axis("pphi", 10, (-0.8, 0.6), AxisMap(lower="pphi_circ"))], boundary=boundary),
+    }
+    results = []
+    for name, grid in variants.items():
+        r, pr, pphi = grid.physical_points().T
+        interp = grid.fit(0.5 * pr**2 + 0.5 * pphi**2 / r**2 - 1 / r)
+        rng = np.random.default_rng(0)
+        rs = rng.uniform(6.5, 15.5, BATCH)
+        pts = np.stack([rs, rng.uniform(-0.1, 0.1, BATCH), np.sqrt(rs) + rng.uniform(-0.5, 0.4, BATCH)],
+                       axis=1)
+        out = np.empty((4, 1))
+        row = {"variant": name}
+        if isinstance(interp, ChebyshevInterpolantND):
+            table = interp.raw()
+            ws = table.workspace()
+            row["kernel_us"] = time_us(lambda: _loop_grad(pts, *table, *ws, out), number=50) / BATCH
+        else:
+            table = interp.raw()
+            ws = table.workspace()
+            row["kernel_us"] = time_us(lambda: _loop_grad_physical(pts, *table, *ws, out),
+                                       number=50) / BATCH
+        row["value_and_grad_us"] = time_us(lambda: interp.value_and_grad(*pts[0]))
+        row["batch_us_per_point"] = time_us(lambda: interp.value_and_grad_batch(pts), number=20) / BATCH
+        results.append(row)
+    return results
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[1])
     parser.add_argument("--json", help="also write the results to this JSON file")
@@ -316,6 +380,7 @@ def main():
     results_grad = run_gradient()
     results_ode = run_ode()
     results_sweep = run_batch_sweep(np)
+    results_maps = run_maps()
     if args.gpu:
         import cupy
 
@@ -373,6 +438,13 @@ def main():
         print(f"{r['backend']:<8} {r['B']:>6} {r['batch_us_per_call']:10.2f}us "
               f"{r['batch_us_per_member']:11.3f}us {r['numba_loop_us_per_member']:16.3f}us")
 
+    print(f"\nDomain maps: value + gradient of a (r, p_r, p_phi) = (30, 8, 10) table "
+          f"(raw and batch columns: per point, B = {BATCH})")
+    print(f"{'variant':<26} {'raw kernel':>11} {'value_and_grad':>15} {'batch':>9}")
+    for r in results_maps:
+        print(f"{r['variant']:<26} {r['kernel_us']:9.2f}us {r['value_and_grad_us']:13.2f}us "
+              f"{r['batch_us_per_point']:7.2f}us")
+
     if args.json:
         meta = {
             "date": datetime.datetime.now().isoformat(timespec="seconds"),
@@ -387,7 +459,8 @@ def main():
         with open(args.json, "w") as fh:
             json.dump({"meta": meta, "results": results, "results_nd": results_nd,
                        "results_precontract": results_pc, "results_gradient": results_grad,
-                       "results_ode": results_ode, "results_batch_sweep": results_sweep}, fh, indent=2)
+                       "results_ode": results_ode, "results_batch_sweep": results_sweep,
+                       "results_maps": results_maps}, fh, indent=2)
         print(f"wrote {args.json}")
 
 

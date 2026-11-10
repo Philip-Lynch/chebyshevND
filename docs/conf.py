@@ -20,6 +20,12 @@ extensions = [
 
 napoleon_google_docstring = False
 napoleon_numpy_docstring = True
+# Render parameter and return types as text. As ":type:"/":rtype:" fields,
+# Sphinx would turn every word of e.g. "array, shape (B, d)" into a
+# cross-reference, linking "shape" to whichever documented attribute has that
+# name.
+napoleon_use_param = False
+napoleon_use_rtype = False
 autodoc_member_order = "bysource"
 
 # Render the example notebooks from their stored outputs; don't re-execute

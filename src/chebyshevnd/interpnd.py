@@ -631,18 +631,8 @@ class ChebyshevInterpolantND:
             is False.
         """
         axes, raw = self._resolve_fixed(fixed)
-        xp = array_namespace(*raw)
-        columns = [xp.asarray(v, dtype=xp.float64) for v in raw]
-        if any(c.ndim > 1 for c in columns):
-            raise ValueError("Each fixed value must be a scalar or a 1D array with one value per member.")
-        lengths = {c.shape[0] for c in columns if c.ndim == 1}
-        if not lengths:
-            raise ValueError("precontract_batch() needs at least one array of values; "
-                             "use precontract() for a single set of values.")
-        if len(lengths) > 1:
-            raise ValueError(f"The arrays of fixed values have different lengths: {sorted(lengths)}.")
-        n_members = lengths.pop()
-        values = xp.stack([xp.broadcast_to(c, (n_members,)) for c in columns], axis=1)
+        xp, values = _member_values(raw)
+        n_members = values.shape[0]
 
         _, a, b = self._table_on(xp)
         tables, status = self._precontract_tables(xp, axes, values)
@@ -1079,6 +1069,28 @@ class ChebyshevInterpolantND:
             f"kmax={self._kmax}, outputs={self.n_outputs}, nodes={self._nodes!r}, "
             f"dtype={self.dtype})"
         )
+
+
+def _member_values(raw):
+    """
+    Stack per-member fixed values into a (B, n_fixed) float64 array.
+
+    ``raw`` holds one entry per fixed axis: an array of shape (B,), or a
+    scalar that applies to every member. Returns the array module and the
+    stacked values.
+    """
+    xp = array_namespace(*raw)
+    columns = [xp.asarray(v, dtype=xp.float64) for v in raw]
+    if any(c.ndim > 1 for c in columns):
+        raise ValueError("Each fixed value must be a scalar or a 1D array with one value per member.")
+    lengths = {c.shape[0] for c in columns if c.ndim == 1}
+    if not lengths:
+        raise ValueError("precontract_batch() needs at least one array of values; "
+                         "use precontract() for a single set of values.")
+    if len(lengths) > 1:
+        raise ValueError(f"The arrays of fixed values have different lengths: {sorted(lengths)}.")
+    n_members = lengths.pop()
+    return xp, xp.stack([xp.broadcast_to(c, (n_members,)) for c in columns], axis=1)
 
 
 def _parse_domains(domains):
