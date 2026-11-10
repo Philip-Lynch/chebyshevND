@@ -8,6 +8,7 @@ from .backend import array_namespace, to_numpy
 from .batch import ChebyshevBatch
 from .batched import precontract_tables
 from .batched import evaluate_batch as _evaluate_batch
+from .batched import value_and_grad_batch as _value_and_grad_batch
 from .derivatives import differentiate_coefficients
 from .errors import OutOfDomainError, describe_out_of_domain
 from .kernels import RawTable, evaluate_point, value_and_grad_point
@@ -39,9 +40,9 @@ class ChebyshevInterpolantND:
 
     :meth:`evaluate` handles one point on the CPU. :meth:`evaluate_batch`
     handles many points at once, on NumPy (CPU) or CuPy (GPU) arrays.
-    :meth:`value_and_grad` adds the gradient at little extra cost, and
-    :meth:`raw` exposes the table to the user's own Numba code (see
-    :func:`chebyshevnd.eval_into`).
+    :meth:`value_and_grad` and :meth:`value_and_grad_batch` add the gradient
+    at little extra cost, and :meth:`raw` exposes the table to the user's own
+    Numba code (see :func:`chebyshevnd.eval_into`).
 
     Evaluation reuses scratch buffers held by the instance, so one instance
     must not be evaluated from several threads at once.
@@ -382,6 +383,46 @@ class ChebyshevInterpolantND:
             )
         grad = out[1:, 0].copy() if self._single else out[1:].copy()
         return self._result(out[0]), grad
+
+    def value_and_grad_batch(self, points, return_status=False):
+        """
+        Evaluate the interpolant and its gradient at many points at once.
+
+        The batch version of :meth:`value_and_grad`, on the CPU (NumPy) or
+        the GPU (CuPy), like :meth:`evaluate_batch`.
+
+        Parameters
+        ----------
+        points : array, shape (B, d)
+            As for :meth:`evaluate_batch`.
+        return_status : bool, optional
+            If True, return the per-point status instead of raising for
+            points outside the domain.
+
+        Returns
+        -------
+        values : array
+            Shape (B,) for a single function, (B, F) with a function axis.
+        grads : array
+            Shape (B, d) for a single function, (B, d, F) with a function
+            axis: ``grads[j, i]`` is the derivative along axis i at point j.
+        status : int64 array, shape (B,)
+            Only if ``return_status``; as for :meth:`evaluate_batch`.
+
+        Raises
+        ------
+        OutOfDomainError
+            If any point is outside the domain and ``return_status`` is False.
+        """
+        xp, pts = self._batch_points(points)
+        coeffs, a, b = self._table_on(xp)
+        values, grads, status = _value_and_grad_batch(coeffs, a, b, pts, tol=self._domain_tol)
+        if self._single:
+            values, grads = values[:, 0], grads[..., 0]
+        if return_status:
+            return values, grads, status
+        self._check_batch_status(xp, pts, status)
+        return values, grads
 
     def raw(self):
         """

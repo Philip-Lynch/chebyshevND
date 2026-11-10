@@ -12,7 +12,10 @@ from chebyshevnd import (
     Workspace,
     eval_grad_into,
     eval_into,
+    value_and_grad_batch,
 )
+from chebyshevnd.backend import array_namespace, to_numpy
+from chebyshevnd.batched import chebyshev_basis_batch
 from chebyshevnd.kernels import chebyshev_basis_and_derivative
 from helpers import sample_on_grid
 
@@ -79,6 +82,18 @@ def test_basis_and_derivative_match_numpy():
             e[k] = 1.0
             assert basis[k] == pytest.approx(npcheb.chebval(t, e), abs=1e-14)
             assert deriv[k] == pytest.approx(npcheb.chebval(t, npcheb.chebder(e)), abs=1e-12)
+
+
+def test_basis_batch_any_shape_and_derivative():
+    ts = np.random.default_rng(1).uniform(-1, 1, size=(7, 3))
+    T, D = chebyshev_basis_batch(ts, 9, np, derivative=True)
+    assert T.shape == D.shape == (7, 3, 9)
+    basis, deriv = np.empty(9), np.empty(9)
+    for idx in np.ndindex(ts.shape):
+        chebyshev_basis_and_derivative(9, ts[idx], basis, deriv)
+        np.testing.assert_allclose(T[idx], basis, atol=1e-15)
+        np.testing.assert_allclose(D[idx], deriv, atol=1e-13)
+    np.testing.assert_array_equal(chebyshev_basis_batch(ts, 9, np), T)
 
 
 # ------------------------------------------------------- single-point fused
@@ -265,6 +280,78 @@ def test_size_checks():
         eval_into(*other, p, *ws, np.empty(3))
 
 
+# ------------------------------------------------------------------ batched
+
+
+@pytest.mark.parametrize("dtype", [float, complex])
+@pytest.mark.parametrize("multi", [False, True])
+def test_value_and_grad_batch_matches_pointwise(dtype, multi):
+    nd = build(dtype, multi)
+    pts = np.concatenate([random_points(30), corner_points()])
+    values, grads = nd.value_and_grad_batch(pts)
+    assert values.shape == ((len(pts),) if not multi else (len(pts), 3))
+    assert grads.shape == ((len(pts), 3) if not multi else (len(pts), 3, 3))
+    assert values.dtype == grads.dtype == nd.dtype
+    for p, v, g in zip(pts, values, grads):
+        value, grad = nd.value_and_grad(*p)
+        assert_close_relative(v, value, 1e-13)
+        assert_close_relative(g, grad, 1e-13)
+
+
+def test_value_and_grad_batch_chunked():
+    nd = build(complex)
+    pts = random_points(25)
+    coeffs = nd.get_coefficients()
+    a, b = np.array(DOMAINS).T
+    whole = value_and_grad_batch(coeffs, a, b, pts)
+    chunked = value_and_grad_batch(coeffs, a, b, pts, max_chunk_bytes=1)
+    for x, y in zip(whole, chunked):
+        np.testing.assert_allclose(y, x, rtol=1e-13, atol=1e-16)
+
+
+def test_value_and_grad_batch_status_and_empty():
+    nd = build()
+    pts = random_points(5)
+    pts[2, 1] = 10.0
+    with pytest.raises(OutOfDomainError, match="1 of 5 points"):
+        nd.value_and_grad_batch(pts)
+    _, _, status = nd.value_and_grad_batch(pts, return_status=True)
+    np.testing.assert_array_equal(status, [0, 0, 0b010, 0, 0])
+    values, grads = nd.value_and_grad_batch(np.empty((0, 3)))
+    assert values.shape == (0, 3) and grads.shape == (0, 3, 3)
+
+
+@pytest.mark.parametrize("dtype", [float, complex])
+def test_batch_members_value_and_grad(dtype):
+    nd = build(dtype)
+    pts = random_points(12)
+    batch = nd.precontract_batch({"y": pts[:, 1]})
+    values, grads = batch.value_and_grad(pts[:, [0, 2]])
+    assert grads.shape == (12, 2, 3)
+    for j, p in enumerate(pts):
+        child = nd.precontract({"y": p[1]})
+        value, grad = child.value_and_grad(p[0], p[2])
+        assert_close_relative(values[j], value, 1e-13)
+        assert_close_relative(grads[j], grad, 1e-13)
+    bad = pts[:, [0, 2]].copy()
+    bad[3, 1] = -5.0
+    with pytest.raises(OutOfDomainError, match="member 3"):
+        batch.value_and_grad(bad)
+    _, _, status = batch.value_and_grad(bad, return_status=True)
+    assert int(status[3]) == 0b10
+
+
+def test_batch_single_function_shapes():
+    nd = build(multi=False)
+    pts = random_points(6)
+    batch = nd.precontract_batch({0: pts[:, 0], 2: pts[:, 2]})
+    values, grads = batch.value_and_grad(pts[:, 1])
+    assert values.shape == (6,) and grads.shape == (6, 1)
+    for j, p in enumerate(pts):
+        _, grad = nd.value_and_grad(*p)
+        assert grads[j, 0] == pytest.approx(grad[1], rel=1e-12)
+
+
 # ------------------------------------------------- toy Hamiltonian end to end
 
 
@@ -313,3 +400,40 @@ def test_kepler_orbit_from_interpolated_hamiltonian():
     np.testing.assert_allclose(r, p / (1 + e * np.cos(phi)), rtol=1e-10)
     exact_energy = -(1 - e**2) / (2 * p)
     assert energy[0] == pytest.approx(exact_energy, rel=1e-11)
+
+
+# ------------------------------------------------------------------- GPU
+
+
+@pytest.fixture
+def cupy():
+    cp = pytest.importorskip("cupy")
+    try:
+        if cp.cuda.runtime.getDeviceCount() < 1:
+            pytest.skip("no CUDA device")
+    except cp.cuda.runtime.CUDARuntimeError:
+        pytest.skip("no CUDA device")
+    return cp
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize("dtype", [float, complex])
+def test_gpu_value_and_grad_batch_matches_cpu(cupy, dtype):
+    nd = build(dtype)
+    pts = random_points(40)
+    cpu_values, cpu_grads = nd.value_and_grad_batch(pts)
+    gpu_values, gpu_grads = nd.value_and_grad_batch(cupy.asarray(pts))
+    assert array_namespace(gpu_grads) is cupy
+    np.testing.assert_allclose(to_numpy(gpu_values), cpu_values, rtol=1e-13, atol=1e-16)
+    np.testing.assert_allclose(to_numpy(gpu_grads), cpu_grads, rtol=1e-13, atol=1e-15)
+
+
+@pytest.mark.gpu
+def test_gpu_batch_members_value_and_grad(cupy):
+    nd = build()
+    pts = random_points(16)
+    cpu = nd.precontract_batch({"y": pts[:, 1]}).value_and_grad(pts[:, [0, 2]])
+    gpu_batch = nd.precontract_batch({"y": cupy.asarray(pts[:, 1])})
+    gpu = gpu_batch.value_and_grad(cupy.asarray(pts[:, [0, 2]]))
+    for c, g in zip(cpu, gpu):
+        np.testing.assert_allclose(to_numpy(g), c, rtol=1e-13, atol=1e-15)

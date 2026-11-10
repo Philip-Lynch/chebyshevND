@@ -1,7 +1,7 @@
 """Per-member Chebyshev tables for a batch of members, e.g. waveforms."""
 
 from .backend import array_namespace, to_numpy
-from .batched import evaluate_batch
+from .batched import evaluate_batch, value_and_grad_batch
 from .errors import OutOfDomainError, describe_out_of_domain
 
 
@@ -124,6 +124,59 @@ class ChebyshevBatch:
         OutOfDomainError
             If any point is outside the domain and ``return_status`` is False.
         """
+        xp, pts = self._points(points)
+        values, status = evaluate_batch(self._tables, self._a, self._b, pts, tol=self._domain_tol)
+        if self._single:
+            values = values[:, 0]
+        if return_status:
+            return values, status
+        self._check_status(xp, pts, status)
+        return values
+
+    def value_and_grad(self, points, return_status=False):
+        """
+        Evaluate each member and its gradient at its own point.
+
+        The value and the derivative along every remaining axis come from
+        one pass over each member's table, e.g. for Hamilton's equations of
+        an interpolated Hamiltonian in a batched ODE solve.
+
+        Parameters
+        ----------
+        points : array, shape (B, d)
+            As for :meth:`evaluate`.
+        return_status : bool, optional
+            If True, return the per-member status instead of raising for
+            points outside the domain.
+
+        Returns
+        -------
+        values : array
+            Shape (B,) for a single function, (B, F) with a function axis.
+        grads : array
+            Shape (B, d) for a single function, (B, d, F) with a function
+            axis: ``grads[j, i]`` is member j's derivative along remaining
+            axis i, in the domain's units.
+        status : int64 array, shape (B,)
+            Only if ``return_status``; as for :meth:`evaluate`.
+
+        Raises
+        ------
+        OutOfDomainError
+            If any point is outside the domain and ``return_status`` is False.
+        """
+        xp, pts = self._points(points)
+        values, grads, status = value_and_grad_batch(self._tables, self._a, self._b, pts,
+                                                     tol=self._domain_tol)
+        if self._single:
+            values, grads = values[:, 0], grads[..., 0]
+        if return_status:
+            return values, grads, status
+        self._check_status(xp, pts, status)
+        return values, grads
+
+    def _points(self, points):
+        """The tables' array module, and `points` on that device, checked to be (B, d)."""
         xp = array_namespace(self._tables)
         pts = xp.asarray(points, dtype=xp.float64)
         if pts.ndim == 1 and self.ndim == 1:
@@ -133,11 +186,10 @@ class ChebyshevBatch:
                 f"points must have shape ({self.n_members}, {self.ndim}): one point per member, "
                 f"axes {self._axis_names}; got {tuple(pts.shape)}."
             )
-        values, status = evaluate_batch(self._tables, self._a, self._b, pts, tol=self._domain_tol)
-        if self._single:
-            values = values[:, 0]
-        if return_status:
-            return values, status
+        return xp, pts
+
+    def _check_status(self, xp, pts, status):
+        """Raise OutOfDomainError describing the first member with a nonzero status, if any."""
         bad = status != 0
         if bool(xp.any(bad)):
             first = int(xp.flatnonzero(bad)[0])
@@ -147,7 +199,6 @@ class ChebyshevBatch:
                 + describe_out_of_domain(self._axis_names, self._a_host, self._b_host,
                                          to_numpy(pts[first]), int(status[first])) + "."
             )
-        return values
 
     def __repr__(self):
         return (
