@@ -425,3 +425,48 @@ def test_nan_coordinate_is_out_of_domain():
     _, _, _, _, nd = build(2)
     with pytest.raises(OutOfDomainError, match="nan"):
         nd.evaluate(np.nan, 1.0)
+
+
+# ------------------------------------------------------------- error_by_axis
+
+
+def test_error_by_axis_shapes_and_maximum():
+    domains = [(0.0, 2.0), (-1.0, 3.0), (1.0, 4.0)]
+    _, vals = sample_on_grid(lambda x, y, z: np.sin(x) * np.cos(y) * np.exp(-z), domains, (14, 22, 9))
+    interp = ChebyshevInterpolantND(vals, domains)
+    per_axis = interp.error_by_axis()
+    assert per_axis.shape == (3,)
+    assert per_axis.max() == pytest.approx(interp.absolute_error(), rel=1e-15)
+    # z has the fewest nodes for its variation, so it limits the accuracy
+    assert np.argmax(per_axis) == 2
+    np.testing.assert_allclose(interp.error_by_axis(relative=True),
+                               per_axis / np.abs(interp.get_coefficients()).max())
+    multi = ChebyshevInterpolantND(np.stack([vals, 2 * vals], axis=-1), domains, output_names=["a", "b"])
+    np.testing.assert_allclose(multi.error_by_axis()[:, 1], 2 * multi.error_by_axis()[:, 0])
+    np.testing.assert_allclose(multi.error_by_axis(relative=True)[:, 0],
+                               multi.error_by_axis(relative=True)[:, 1])
+
+
+def test_error_by_axis_on_exact_polynomial_axis():
+    # Linear in x: with 3 nodes the top genuine coefficient sits in the
+    # second-to-last slice and is reported; one more node shows the series ended
+    f = lambda x, y: (1.0 + 0.5 * x) * np.exp(np.sin(y))
+    domains = [(0.0, 1.0), (0.0, 2.0)]
+    tight = ChebyshevInterpolantND(sample_on_grid(f, domains, (3, 30))[1], domains)
+    spare = ChebyshevInterpolantND(sample_on_grid(f, domains, (4, 30))[1], domains)
+    assert tight.error_by_axis(relative=True)[0] > 1e-2
+    assert spare.error_by_axis(relative=True)[0] < 1e-14
+    assert spare.error_by_axis(relative=True)[1] < 1e-12
+
+
+def test_error_by_axis_of_derivative_skips_zero_top_coefficients():
+    domains = [(0.0, 2.0), (-1.0, 3.0)]
+    _, vals = sample_on_grid(lambda x, y: np.sin(x) * np.cos(y), domains, (16, 20))
+    interp = ChebyshevInterpolantND(vals, domains)
+    deriv = interp.derivative((2, 0))
+    per_axis = deriv.error_by_axis()
+    # The derivative's last two x coefficients are exactly zero; the estimate
+    # comes from the slices before them, not from those zeros
+    assert np.all(deriv.get_coefficients(full=True)[-2:] == 0)
+    assert per_axis[0] > 0
+    assert per_axis[0] <= deriv.absolute_error()

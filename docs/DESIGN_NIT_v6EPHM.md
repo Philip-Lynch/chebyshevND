@@ -1,15 +1,17 @@
 # ChebyshevND — design document for the NIT / SEOBNRv6EPHM extension
 
-**Revision:** 3.6 (2026-11-10).
-- Steps 1–6 are implemented; §3 records what was built and where it
+**Revision:** 3.7 (2026-11-10).
+- Steps 1–6 and 8 are implemented; §3 records what was built and where it
   differs from the plan.
+- Step 7 is deferred (D7): the NIT now uses an (α, β) equinoctial
+  parametrisation, which removes the `1/e` behaviour of `f_w`.
 - GPU support with CUDA via CuPy is now a requirement (§0.3, A8, D6).
 - The second consumer is an interpolated post-Minkowskian (PM) Hamiltonian
   (§0.2).
 - Step 0 is complete (v0.1.1).
 - §9 lists all revisions and maps the old step numbers to the new ones.
 
-**Branch:** `dev` (v0.1.1 plus Steps 1–6).
+**Branch:** `dev` (v0.1.1 plus Steps 1–6 and 8; version 0.2.0).
 
 **Purpose:** turn ChebyshevND from a 1D–4D single-function interpolator into the
 tabulation-and-evaluation backend for:
@@ -124,7 +126,8 @@ cheaper than the analytic Hamiltonian + gradient it replaces, so measure that
 on the first real table. On the GPU, the baseline is the analytic PM
 Hamiltonian evaluated in batch on the same GPU (§5.1 Q5), which is
 comparatively cheaper there than on a CPU. The levers are pruning, maps, and
-subtracting an analytic baseline (Step 7).
+subtracting an analytic baseline (done in the user's RHS: tabulate `H − H₀`
+and add `H₀` and its gradient back; see D7).
 
 Sampling `H` should be far cheaper than sampling the NIT forcing, which
 needs orbit integrations and Fourier decompositions. That makes this project
@@ -398,7 +401,7 @@ and batches, instead of rewriting it several times.
   `clenshaw_nd` takes 20 µs on 12⁴, down from ~34 ms. The 2D gap is fixed
   Python-level overhead, which Step 4a's compiled entry point avoids.
   Step 8 must benchmark the 2D/3D wrappers before replacing the v0.1
-  classes (D5).
+  classes (D5). It did, and the v0.1 classes were kept (D5, revised).
 - **GPU tests** (`pytest -m gpu`) are written but have not yet been run on a
   CUDA machine.
 
@@ -1023,11 +1026,29 @@ on CPU and GPU.
     "upgrade" hint);
   - an unknown kind;
   - a grid whose hash does not match.
-- **Prefactor specs** (Step 7) are not in format 1. Adding them will need
-  a new format version if a version-1 reader would otherwise silently
-  ignore them.
+- **Prefactor specs** (Step 7) are not in format 1. Step 7 is deferred
+  (D7), so format 1 stands. Adding prefactors later would need a new format
+  version if a version-1 reader would otherwise silently ignore them.
 
-### Step 7 — Regularised tabulation
+### Step 7 — Regularised tabulation — DEFERRED (D7)
+
+**Deferred on 2026-11-10.** Nothing that needs it remains:
+- The NIT now uses an (α, β) equinoctial parametrisation, which removes the
+  `1/e` behaviour of `f_w`. If the averaged equations take the form
+  `F_α = α·G(p, e²)`, tabulate the regular `G` with
+  `AxisMap("power", power=2)` on the e axis. That gives the even-in-e
+  reduction considered below, with no new code, and avoids tabulating on a
+  box in (α, β), which would not match the disk `e ≤ e_max`.
+- Square-root behaviour at the separatrix is handled by Step 5's maps,
+  which the design below already preferred.
+- The PM Hamiltonian's additive baseline lives in the user's RHS. The
+  package only has to record `H₀`'s name, which Step 6's metadata does.
+
+Dropping the step also avoids a third run-time layer written twice (Numba
+and `xp`) and a file format version 2. When the first (α, β) tables exist,
+check the coefficient decay along e and run `check_derivatives` near e = 0.
+If singular behaviour turns up after all (e.g. in the precession moments or
+the mode amplitudes), the design below still applies.
 
 **Why:** `f_w ∼ 1/e` as `e → 0`; √-type behaviour near the separatrix.
 
@@ -1060,7 +1081,7 @@ on CPU and GPU.
   convergence.
 - Product-rule derivatives vs finite differences.
 
-### Step 8 — Consolidation and polish (release `0.2.0`)
+### Step 8 — Consolidation and polish (release `0.2.0`) — IMPLEMENTED
 
 - Turn `ChebyshevInterpolant1D…4D` into thin wrappers over the nD class
   with the same public API, and route `precompute_x` / `evaluate_yz(w)`
@@ -1085,22 +1106,69 @@ on CPU and GPU.
 - README (A3 wording, a GPU section, roadmap), `docs/api.rst`, examples;
   version `0.2.0`.
 
+**As built** (2026-11-10, branch `step8-consolidation`):
+- **The 1D–4D classes are kept as they are (D5, revised): no wrappers.**
+  The benchmark Step 1 asked for:
+
+  | v0.1 class → nD class, µs per call | evaluate | after `optimize` |
+  |---|---|---|
+  | 1D | 2.1 → 1.4 | 1.9 → 1.0 |
+  | 2D | 1.4 → 1.7 | 0.58 → 1.27 |
+  | 3D | 3.3 → 3.5 | 1.56 → 2.16 |
+  | 4D | 15.2 → 12.5 | 5.3 → 4.3 |
+
+  The nD path carries ~0.8 µs more Python and dispatch overhead per call,
+  so wrappers would slow down the 2D/3D cases and the `precompute_x` paths.
+  Keeping v0.1 behaviour would also need shims: no domain check, the 1D
+  error estimate, the 2D staircase, settable `coeffs`. The classes stay as
+  the simple fixed-dimension API, already fixed in v0.1.1, and
+  `test_matches_v01_classes` keeps them in agreement with the nD class.
+  The staircase question is moot.
+- **No per-function-group pruning.** There is no real multi-output table
+  yet to show that the union `kmax` is wasteful; revisit with the first NIT
+  tables.
+- **Resolution diagnostics:** `error_by_axis(relative=False)` gives the
+  trailing-coefficient estimate per axis and function, to set node counts
+  per axis.
+  - The estimate now skips trailing slices that are exactly zero (a
+    derivative's top coefficients), which leaves every other estimate
+    unchanged.
+  - The polynomial-axis case is inherent: from N samples one cannot tell
+    an exact polynomial of degree N − 2 from an unresolved series. It is
+    therefore documented, not changed, and one or two more nodes on that
+    axis settle it.
+- **An example notebook instead of a benchmarks notebook**
+  (`examples/example_nd_workflow.ipynb`, rendered in the docs). It covers a
+  multi-function table, precontraction (11.9 → 1.2 µs per call in its
+  example), derivatives, a Numba RHS, a Hamiltonian through maps, chunked
+  sampling and files. Benchmarks stay in `benchmarks/bench_evaluate.py`.
+- **README and docs landing page** updated:
+  - features;
+  - extras;
+  - an nD quickstart;
+  - A3's wording;
+  - the domain-check difference;
+  - the roadmap;
+  - GPU tests.
+- **Version 0.2.0** in `pyproject.toml` and `CITATION.cff`. Run
+  `pytest -m gpu` on a CUDA machine before publishing the release.
+
 ---
 
 ## 4. How the steps map to the project milestones
 
 | Milestone | Steps required |
 |---|---|
-| Nonspinning v6EHM NIT (3D grid, 0/1/2PA, handover) | 0–6. Step 7 is optional: the `1/e` prefactor can be applied by hand in the builder |
+| Nonspinning v6EHM NIT (3D grid, 0/1/2PA, handover) | 0–6 (done). Step 7 is not needed: the (α, β) parametrisation removes the `1/e` (D7) |
 | Aligned-spin v6EHM NIT (5D grid) | Step 5 checkpointing becomes essential (grid builds get expensive); cheap spin axes via per-axis N |
 | Precessing v6EPHM NIT (5D grid + moment tables `g_n`, derivative tables for in-plane scalars) | All steps. Step 2 must support precontracting only `ν` while the spin-projection axes stay live; that live 4D table is the main performance risk (§0.1) |
 | Multivoice waveform interpolation (mode amplitudes) | Steps 1, 2, 6 (float32), 8 (the amplitude grid is coarser and separate from the dynamics grid) |
-| Interpolated PM Hamiltonian (§0.2) | Steps 0–4 and 5a. Step 6 to share tables; 5b only to organise sampling; Step 7's baseline if pruning leaves the table too large |
+| Interpolated PM Hamiltonian (§0.2) | Steps 0–4 and 5a (done). Step 6 to share tables; 5b only to organise sampling; an additive baseline, if pruning leaves the table too large, lives in the user's RHS (D7) |
 | Batched GPU runs (CuPy) of any milestone above | Additionally 1e, 2b, 4b, the `xp` maps of 5a, and Step 6's device loading, all validated on a CUDA machine (§6) |
 
 ---
 
-## 5. Decisions (settled 2026-10-18; D1 revised and D6 added 2026-11-09)
+## 5. Decisions (settled 2026-10-18; D1 revised and D6 added 2026-11-09; D5 revised and D7 added 2026-11-10)
 
 | # | Question | Answer | Consequence |
 |---|---|---|---|
@@ -1108,7 +1176,8 @@ on CPU and GPU.
 | D2 | Are derivatives evaluated in every RHS call? | **NIT: no.** Derivatives build the higher-PA grids, and production folds the entire RHS into a single interpolant. **PM Hamiltonian: yes** (§0.2): value + gradient every call | Step 3 builds the NIT tables and is the oracle for Step 4. Step 4 includes the fused value + gradient kernel on both paths (Hessian on demand). The maps' Jacobian and chain rule join the hot path (5a). No derivative-aware precontraction and no stored derivative tensors |
 | D3 | Must sampling start before the evaluation stack is done? | No | Step order unchanged: Step 5 after Step 4 |
 | D4 | Serialization format | HDF5 only, for now | Step 6 |
-| D5 | 1D–4D wrappers; 2D staircase pruning | Wrappers in Step 8; drop the staircase unless a benchmark shows it beats rectangular `kmax` | Step 8 |
+| D5 | 1D–4D wrappers; 2D staircase pruning | **Revised 2026-11-10: keep the 1D–4D classes as they are.** Measured, wrappers would slow the 2D/3D and `precompute_x` paths (~0.8 µs more overhead per call) and change documented v0.1 behaviour | Step 8 adds no wrappers; the staircase stays in the 2D class; a cross-check test keeps the classes in agreement with the nD class |
+| D7 | Regularised tabulation (Step 7) | **Deferred (2026-11-10):** the NIT uses an (α, β) equinoctial parametrisation without the `1/e`; Step 5's maps handle the separatrix; the PM baseline lives in the user's RHS | No `prefactors.py`; file format stays at version 1; Step 7's design kept for later |
 | D6 | GPU framework | **CUDA via CuPy**, matching pySEOBNR's GPU port | A8; sub-steps 1e, 2b and 4b; `xp` maps (5a); device loading (Step 6); CuPy as an optional `gpu` extra; GPU tests run on a CUDA machine (§6) |
 
 ### 5.1 Open questions for the software engineer
@@ -1171,12 +1240,21 @@ These change details of 1e, 2b and 4b, not the plan's structure.
 | 4 (done) | `kernels.py` (`value_and_grad_point`, `eval_into`, `eval_grad_into`, `RawTable`, `Workspace`), `batched.py` (`value_and_grad_batch`, basis rewrite), `batch.py` (`value_and_grad`), `interpnd.py` (`raw`, `value_and_grad`, `value_and_grad_batch`); `docs/api.rst`; benchmarks; tests `test_fused.py`. `cuda_kernels.py` (RawKernel) deferred to the GPU follow-up |
 | 5 (done) | 5a: new `maps.py` (`AxisMap`, packing, `xp` and Numba maps, `eval_physical_into`, `eval_grad_physical_into`, `RawMappedTable`), new `mapped.py` (`MappedInterpolant`, `MappedBatch`), `interpnd.py` (shared per-member value stacking); 5b: new `grid.py` (`Axis`, `ChebyshevGrid`); `docs/api.rst`, `docs/conf.py`; benchmarks; tests `test_mapped.py`, `test_grid.py` |
 | 6 (done) | new `io.py` (`save`, `load`, `read_metadata`), `interpnd.py` and `mapped.py` (`to_device`), `backend.py` (`resolve_device`), `pyproject.toml` (`io` extra), CI (installs it), new `docs/file_format.md`, `docs/api.rst`, `docs/index.md`; tests `test_io.py` |
-| 7 | new `prefactors.py` |
-| 8 | `interp1d–4d.py`, README, `docs/api.rst`, examples, benchmarks |
+| 7 (deferred) | — |
+| 8 (done) | `interpnd.py` (`error_by_axis`), new `examples/example_nd_workflow.ipynb`, README, `docs/index.md`, `pyproject.toml` and `CITATION.cff` (0.2.0); tests in `test_interpnd.py` |
 
 ---
 
 ## 9. Revision history
+
+**Revision 3.7 (2026-11-10).** Step 7 deferred (D7) and Step 8 implemented
+(branch `step8-consolidation`):
+- D5 revised: the 1D–4D classes are kept, on the evidence of the
+  benchmarks;
+- `error_by_axis`;
+- an example notebook instead of a benchmarks notebook;
+- README and docs updated;
+- version 0.2.0.
 
 **Revision 3.6 (2026-11-10).** Step 6 implemented (branch
 `step6-serialization`). Step 6 now records how it was built and where it
