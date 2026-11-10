@@ -1,11 +1,12 @@
 """
 Per-call evaluation timings for the 1D-4D interpolants and ChebyshevInterpolantND,
-including precontraction.
+including precontraction, gradients and use inside an ODE right-hand side.
 
 Run before and after a change to see its effect on evaluation cost:
 
     python benchmarks/bench_evaluate.py
     python benchmarks/bench_evaluate.py --json results.json
+    python benchmarks/bench_evaluate.py --gpu   # adds a CuPy batch-size sweep
 
 Timings are the best of several repeats, in microseconds per call, and
 include the Python-level call overhead a user sees. They depend on the
@@ -22,6 +23,8 @@ import timeit
 import numba
 import numpy as np
 import scipy
+from numba import njit
+from scipy.integrate import solve_ivp
 
 from chebyshevnd import (
     ChebyshevInterpolant1D,
@@ -30,6 +33,8 @@ from chebyshevnd import (
     ChebyshevInterpolant4D,
     ChebyshevInterpolantND,
     chebyshev_nodes,
+    eval_grad_into,
+    eval_into,
 )
 
 # (class, test function, per-axis domains, per-axis node counts). The 4D grid
@@ -155,14 +160,166 @@ def run_precontract():
     return results
 
 
+def _nd_case(dim):
+    """The ChebyshevInterpolantND benchmark case of dimension `dim`: (interp, point, domains)."""
+    f, domains, Ns = ND_5D if dim == 5 else (CASES[dim][1], CASES[dim][2], CASES[dim][3])
+    axes = [chebyshev_nodes(N, a, b) for N, (a, b) in zip(Ns, domains)]
+    interp = ChebyshevInterpolantND(f(*np.meshgrid(*axes, indexing="ij")), domains)
+    point = [0.5 * (a + b) + 0.1 * (b - a) for a, b in domains]
+    return interp, point, domains
+
+
+@njit
+def _loop_eval(points, coeffs, shape, bounds, tol, scratch, work, out):
+    status = 0
+    for i in range(points.shape[0]):
+        status |= eval_into(coeffs, shape, bounds, tol, points[i], scratch, work, out)
+    return status
+
+
+@njit
+def _loop_grad(points, coeffs, shape, bounds, tol, scratch, work, out):
+    status = 0
+    for i in range(points.shape[0]):
+        status |= eval_grad_into(coeffs, shape, bounds, tol, points[i], scratch, work, out)
+    return status
+
+
+def run_gradient():
+    """Value vs value + gradient: Python methods, raw kernels from Numba, and batches."""
+    results = []
+    for dim in range(1, 6):
+        interp, point, domains = _nd_case(dim)
+        lo, hi = np.array(domains).T
+        batch = np.random.default_rng(0).uniform(lo, hi, size=(BATCH, dim))
+        row = {"dim": dim, "kmax": list(interp.kmax)}
+        row["evaluate_us"] = time_us(lambda: interp.evaluate(*point))
+        row["value_and_grad_us"] = time_us(lambda: interp.value_and_grad(*point))
+
+        table = interp.raw()
+        ws = table.workspace()
+        out = np.empty(table.n_outputs)
+        out_grad = np.empty((dim + 1, table.n_outputs))
+        row["eval_into_us"] = time_us(lambda: _loop_eval(batch, *table, *ws, out), number=20) / BATCH
+        row["eval_grad_into_us"] = time_us(lambda: _loop_grad(batch, *table, *ws, out_grad), number=20) / BATCH
+        row["batch_us_per_point"] = time_us(lambda: interp.evaluate_batch(batch), number=20) / BATCH
+        row["batch_grad_us_per_point"] = time_us(lambda: interp.value_and_grad_batch(batch), number=20) / BATCH
+        results.append(row)
+    return results
+
+
+# Toy averaged RHS: (nu, u, e) table with outputs (du/dchi, de/dchi), nu fixed per waveform
+ODE_DOMAINS = [(0.0, 0.25), (-3.0, -1.0), (0.0, 0.9)]
+ODE_NODES = (10, 30, 20)
+
+
+def _ode_rhs_values(nu, u, e):
+    du = 0.02 * (1 + nu) * (1 + 0.3 * e**2 * np.cos(u))
+    de = -0.01 * e * (1 + 0.2 * np.sin(u) + nu)
+    return np.stack([du, de], axis=-1)
+
+
+@njit
+def _rhs_trivial(y):
+    return np.array([0.02 * (1 + 0.3 * y[1] ** 2), -0.01 * y[1]])
+
+
+@njit
+def _rhs_table(y, coeffs, shape, bounds, tol, scratch, work, out):
+    eval_into(coeffs, shape, bounds, tol, y, scratch, work, out)
+    return out.copy()
+
+
+def run_ode():
+    """A toy 2-variable averaged RHS integrated with scipy's DOP853."""
+    axes = [chebyshev_nodes(N, a, b) for N, (a, b) in zip(ODE_NODES, ODE_DOMAINS)]
+    vals = _ode_rhs_values(*np.meshgrid(*axes, indexing="ij"))
+    interp = ChebyshevInterpolantND(vals, ODE_DOMAINS, axis_names=["nu", "u", "e"],
+                                    output_names=["du", "de"])
+    child = interp.precontract({"nu": 0.2})
+    table = child.raw()
+    ws = table.workspace()
+    out = np.empty(2)
+    y0 = np.array([-2.9, 0.5])
+    span = (0.0, 80.0)
+
+    rhs = {
+        "trivial jitted RHS (integrator floor)": lambda t, y: _rhs_trivial(y),
+        "Python RHS calling evaluate()": lambda t, y: child.evaluate(*y),
+        "jitted RHS calling eval_into()": lambda t, y: _rhs_table(y, *table, *ws, out),
+    }
+    results = []
+    for name, fn in rhs.items():
+        sol = solve_ivp(fn, span, y0, method="DOP853", rtol=1e-10, atol=1e-12)
+        total = time_us(lambda: solve_ivp(fn, span, y0, method="DOP853", rtol=1e-10, atol=1e-12),
+                        number=5, repeat=5)
+        results.append({"rhs": name, "nfev": int(sol.nfev), "total_ms": total / 1e3,
+                        "us_per_call": total / sol.nfev})
+    floor = results[0]["us_per_call"]
+    for r in results:
+        r["evaluation_share"] = max(0.0, 1.0 - floor / r["us_per_call"])
+    return results
+
+
+SWEEP_SIZES = (1, 10, 100, 1000, 10000)
+
+
+def run_batch_sweep(xp):
+    """
+    Per-member cost of a batched value + gradient on per-member tables, vs batch size.
+
+    Compares ``ChebyshevBatch.value_and_grad`` on module `xp` (numpy or cupy)
+    with evaluating the members one by one with ``eval_grad_into`` in a Numba
+    loop on the CPU (one precontracted table, the single-waveform path).
+    """
+    axis_names, domains, Ns = ("nu", "u", "e"), [(0.0, 0.25), (-3.0, -1.0), (0.0, 0.9)], (10, 30, 20)
+    axes = [chebyshev_nodes(N, a, b) for N, (a, b) in zip(Ns, domains)]
+    grids = np.meshgrid(*axes, indexing="ij")
+    vals = np.stack([_nit_like(*grids, k=k) for k in range(4)], axis=-1)
+    interp = ChebyshevInterpolantND(vals, domains, axis_names=axis_names, output_names=list("abcd"))
+    sync = xp.cuda.Device().synchronize if xp.__name__ == "cupy" else (lambda: None)
+
+    table = interp.precontract({"nu": 0.1}).raw()
+    ws = table.workspace()
+    out = np.empty((3, 4))
+    results = []
+    for B in SWEEP_SIZES:
+        lo, hi = np.array(domains).T
+        points = np.random.default_rng(1).uniform(lo, hi, size=(B, 3))
+        batch = interp.precontract_batch({"nu": xp.asarray(points[:, 0])})
+        live = xp.asarray(points[:, 1:])
+
+        def batched():
+            batch.value_and_grad(live)
+            sync()
+
+        number = max(5, 20000 // B)
+        row = {"B": B, "backend": xp.__name__}
+        row["batch_us_per_call"] = time_us(batched, number=number)
+        row["batch_us_per_member"] = row["batch_us_per_call"] / B
+        cpu_points = np.ascontiguousarray(points[:, 1:])
+        row["numba_loop_us_per_member"] = time_us(lambda: _loop_grad(cpu_points, *table, *ws, out),
+                                                  number=number) / B
+        results.append(row)
+    return results
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[1])
     parser.add_argument("--json", help="also write the results to this JSON file")
+    parser.add_argument("--gpu", action="store_true", help="also run the batch-size sweep with CuPy")
     args = parser.parse_args()
 
     results = run()
     results_nd = run_nd()
     results_pc = run_precontract()
+    results_grad = run_gradient()
+    results_ode = run_ode()
+    results_sweep = run_batch_sweep(np)
+    if args.gpu:
+        import cupy
+
+        results_sweep += run_batch_sweep(cupy)
     version = importlib.metadata.version("ChebyshevND")
     print(f"chebyshevnd {version} | numpy {np.__version__} | "
           f"scipy {scipy.__version__} | numba {numba.__version__} | "
@@ -193,6 +350,29 @@ def main():
               f"{r['evaluate_precontracted_us']:8.2f}us {r['precontract_batch_us_per_member']:10.2f}us "
               f"{r['batch_evaluate_us_per_member']:9.2f}us")
 
+    print(f"\nValue vs value + gradient (single function; raw and batch columns: per point, B = {BATCH})")
+    print(f"{'dim':>3}  {'kmax':<18} {'evaluate':>10} {'val+grad':>10} {'ratio':>6} "
+          f"{'eval_into':>10} {'eval_grad':>10} {'ratio':>6} {'batch':>9} {'batch grad':>11}")
+    for r in results_grad:
+        print(f"{r['dim']:>3}  {str(tuple(r['kmax'])):<18} {r['evaluate_us']:8.2f}us "
+              f"{r['value_and_grad_us']:8.2f}us {r['value_and_grad_us'] / r['evaluate_us']:6.2f} "
+              f"{r['eval_into_us']:8.2f}us {r['eval_grad_into_us']:8.2f}us "
+              f"{r['eval_grad_into_us'] / r['eval_into_us']:6.2f} {r['batch_us_per_point']:7.2f}us "
+              f"{r['batch_grad_us_per_point']:9.2f}us")
+
+    print(f"\nODE right-hand side: toy 2-variable averaged RHS, (nu, u, e) = {ODE_NODES} table "
+          f"precontracted at nu, scipy DOP853")
+    print(f"{'right-hand side':<40} {'calls':>6} {'total':>10} {'per call':>10} {'evaluation share':>17}")
+    for r in results_ode:
+        print(f"{r['rhs']:<40} {r['nfev']:>6} {r['total_ms']:8.2f}ms {r['us_per_call']:8.2f}us "
+              f"{100 * r['evaluation_share']:16.0f}%")
+
+    print("\nBatch-size sweep: value + gradient on per-member (u, e) tables, 4 outputs, per member")
+    print(f"{'backend':<8} {'B':>6} {'batch call':>12} {'batch/member':>13} {'numba loop/member':>18}")
+    for r in results_sweep:
+        print(f"{r['backend']:<8} {r['B']:>6} {r['batch_us_per_call']:10.2f}us "
+              f"{r['batch_us_per_member']:11.3f}us {r['numba_loop_us_per_member']:16.3f}us")
+
     if args.json:
         meta = {
             "date": datetime.datetime.now().isoformat(timespec="seconds"),
@@ -206,7 +386,8 @@ def main():
         }
         with open(args.json, "w") as fh:
             json.dump({"meta": meta, "results": results, "results_nd": results_nd,
-                       "results_precontract": results_pc}, fh, indent=2)
+                       "results_precontract": results_pc, "results_gradient": results_grad,
+                       "results_ode": results_ode, "results_batch_sweep": results_sweep}, fh, indent=2)
         print(f"wrote {args.json}")
 
 
