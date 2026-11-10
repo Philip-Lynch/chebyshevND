@@ -13,6 +13,7 @@ from .interpnd import ChebyshevInterpolantND
 from .batch import ChebyshevBatch
 from .batched import evaluate_batch
 from .derivatives import differentiate_coefficients
+from .kernels import RawTable, Workspace, eval_grad_into, eval_into
 
 # Clenshaw evaluation kernels
 from .clenshaw import(clenshaw_1d,
@@ -44,6 +45,10 @@ __all__ = [
     "ChebyshevBatch",
     "OutOfDomainError",
     "evaluate_batch",
+    "RawTable",
+    "Workspace",
+    "eval_into",
+    "eval_grad_into",
     "differentiate_coefficients",
     "clenshaw_1d",
     "clenshaw_2d",
