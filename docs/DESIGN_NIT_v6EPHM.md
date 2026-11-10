@@ -1,7 +1,7 @@
 # ChebyshevND — design document for the NIT / SEOBNRv6EPHM extension
 
-**Revision:** 3.5 (2026-11-10).
-- Steps 1–5 are implemented; §3 records what was built and where it
+**Revision:** 3.6 (2026-11-10).
+- Steps 1–6 are implemented; §3 records what was built and where it
   differs from the plan.
 - GPU support with CUDA via CuPy is now a requirement (§0.3, A8, D6).
 - The second consumer is an interpolated post-Minkowskian (PM) Hamiltonian
@@ -9,7 +9,7 @@
 - Step 0 is complete (v0.1.1).
 - §9 lists all revisions and maps the old step numbers to the new ones.
 
-**Branch:** `dev` (v0.1.1 plus Steps 1–5).
+**Branch:** `dev` (v0.1.1 plus Steps 1–6).
 
 **Purpose:** turn ChebyshevND from a 1D–4D single-function interpolator into the
 tabulation-and-evaluation backend for:
@@ -929,7 +929,10 @@ evaluation stack is done (D3), so this step follows Step 4.
   it on a machine whose arithmetic differs in the last bit changes the
   hash.
 
-### Step 6 — Serialization and metadata
+### Step 6 — Serialization and metadata — IMPLEMENTED
+
+Implemented on branch `step6-serialization` (2026-11-10). "As built" below
+records where it differs from the design.
 
 **Why:** the tables are built once (hours to days of Cython-force sampling),
 reused everywhere, and must be identical between the prototype and pySEOBNR,
@@ -967,6 +970,62 @@ on CPU and GPU.
 - An unknown `format_version` gives a clear error.
 - `load(..., device="cuda")` gives the same results as the CPU load
   (`@pytest.mark.gpu`).
+
+**As built** (differences from the design above):
+- **API** (new `io.py`; h5py is imported on first use, from the `io` extra,
+  which CI now installs):
+  - `save(target, obj, *, metadata=None, float32=False, full=False,
+    overwrite=False)`;
+  - `load(source, *, device="cpu", return_metadata=False)`;
+  - `read_metadata(source)`.
+
+  `target` and `source` are file names or groups of an open `h5py.File`,
+  so several tables can share a file. Saving refuses to replace an
+  existing file or a non-empty group without `overwrite=True`: a table may
+  take days to sample.
+- **Grids are saved too** (`kind = "ChebyshevGrid"`). Workers can then load
+  the very same grid and boundary table, which settles Step 5's caveat that
+  a rebuilt boundary table can change `grid_hash`. On load the hash is
+  recomputed and must match.
+- **The schema is in `docs/file_format.md`**, part of the documentation.
+  - Root attributes: `format`, `format_version` (1), `kind`,
+    `chebyshevnd_version`, `created`.
+  - A `metadata` group.
+  - Per table: `coeffs` (always with the output axis), optional
+    `coeffs_full`, `domains`, and the error estimate in its parts
+    (`error_interpolation`, `error_truncation`, `coeff_scale`), so that
+    `absolute_error` and `relative_error` survive exactly. Also the names,
+    `grid_shape`, `nodes`, `domain_tol`, `dtype` and `storage_dtype`.
+  - Mapped tables: groups `table`, `boundary` and `maps/<axis>`, with the
+    map parameters as attributes. Step 5's single parametrised map needs
+    no registry name.
+- **Full tensor.** Optional (`full=True`) for an optimized table. A table
+  that was never optimized stores its single tensor and gets it back as
+  the full tensor, so `values_at_nodes` and `optimize` work after loading.
+- **float32** applies to the table only (boundary tables stay double).
+  The exact sum of what the rounding lost, `Σ|c − c₃₂|`, is added to
+  `error_truncation`, so the stored estimate still bounds the error.
+- **Metadata** is free-form: strings, numbers, booleans, arrays and
+  sequences of those, and nested mappings (as subgroups). The automatic
+  fields (`kind`, `format_version`, `chebyshevnd_version`, `created`) are
+  reserved keys. `grid_hash` is not recorded automatically, because an
+  interpolant does not know its grid; pass `metadata={"grid_hash":
+  grid.grid_hash()}`.
+- **Devices.** `ChebyshevInterpolantND.to_device("cuda")` and
+  `MappedInterpolant.to_device("cuda")` fill the device caches now (the
+  host copy is always kept for the Numba path), and
+  `load(device="cuda")` calls them. The caches are keyed by module, so they
+  serve CuPy's current device only; several GPUs would need one load per
+  device.
+- **Errors** name the file and group:
+  - not a ChebyshevND table;
+  - another format version (with the writer's version and an
+    "upgrade" hint);
+  - an unknown kind;
+  - a grid whose hash does not match.
+- **Prefactor specs** (Step 7) are not in format 1. Adding them will need
+  a new format version if a version-1 reader would otherwise silently
+  ignore them.
 
 ### Step 7 — Regularised tabulation
 
@@ -1111,13 +1170,24 @@ These change details of 1e, 2b and 4b, not the plan's structure.
 | 3 (done) | new `derivatives.py` (`differentiate_coefficients`); `utils.py` (`chebyshev_values_at_nodes_nd`); `interpnd.py` (`derivative`, `values_at_nodes`, `axis_nodes`, `check_derivatives`); `docs/api.rst`; tests `test_derivatives.py` |
 | 4 (done) | `kernels.py` (`value_and_grad_point`, `eval_into`, `eval_grad_into`, `RawTable`, `Workspace`), `batched.py` (`value_and_grad_batch`, basis rewrite), `batch.py` (`value_and_grad`), `interpnd.py` (`raw`, `value_and_grad`, `value_and_grad_batch`); `docs/api.rst`; benchmarks; tests `test_fused.py`. `cuda_kernels.py` (RawKernel) deferred to the GPU follow-up |
 | 5 (done) | 5a: new `maps.py` (`AxisMap`, packing, `xp` and Numba maps, `eval_physical_into`, `eval_grad_physical_into`, `RawMappedTable`), new `mapped.py` (`MappedInterpolant`, `MappedBatch`), `interpnd.py` (shared per-member value stacking); 5b: new `grid.py` (`Axis`, `ChebyshevGrid`); `docs/api.rst`, `docs/conf.py`; benchmarks; tests `test_mapped.py`, `test_grid.py` |
-| 6 | new `io.py` (with device placement), `pyproject.toml` (`io` extra) |
+| 6 (done) | new `io.py` (`save`, `load`, `read_metadata`), `interpnd.py` and `mapped.py` (`to_device`), `backend.py` (`resolve_device`), `pyproject.toml` (`io` extra), CI (installs it), new `docs/file_format.md`, `docs/api.rst`, `docs/index.md`; tests `test_io.py` |
 | 7 | new `prefactors.py` |
 | 8 | `interp1d–4d.py`, README, `docs/api.rst`, examples, benchmarks |
 
 ---
 
 ## 9. Revision history
+
+**Revision 3.6 (2026-11-10).** Step 6 implemented (branch
+`step6-serialization`). Step 6 now records how it was built and where it
+differs from the plan:
+- grids are saved too;
+- the schema page `docs/file_format.md`;
+- tables saved into groups;
+- exact error estimates;
+- a never-optimized tensor doubles as the full tensor;
+- the float32 rounding is added to the error estimate;
+- `to_device`.
 
 **Revision 3.5 (2026-11-10).** Step 5 implemented (branch `step5-maps-grid`).
 Step 5 now records how it was built and where it differs from the plan:

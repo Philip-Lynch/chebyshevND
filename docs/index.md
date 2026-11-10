@@ -115,6 +115,7 @@ examples/example_4d_interp
 :caption: Reference
 
 api
+file_format
 ```
 
 ## Citation
