@@ -108,6 +108,7 @@ examples/example_1d_interp
 examples/example_2d_interp
 examples/example_3d_interp
 examples/example_4d_interp
+examples/example_nd_workflow
 ```
 
 ```{toctree}
