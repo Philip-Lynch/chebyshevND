@@ -148,3 +148,36 @@ def test_renormalize_gl_only_checks_transformed_axes():
 def test_repeated_axes_rejected():
     with pytest.raises(ValueError):
         compute_chebyshev_coefficients_nd(np.ones((4, 4)), axes=(0, -2))
+
+
+@pytest.mark.parametrize("nodes", ["Chebyshev", "GaussLobatto"])
+def test_values_at_nodes_inverts_coefficients(nodes):
+    from chebyshevnd import chebyshev_values_at_nodes_nd
+    rng = np.random.default_rng(8)
+    vals = rng.standard_normal((7, 5, 6)) + 1j * rng.standard_normal((7, 5, 6))
+    coeffs = compute_chebyshev_coefficients_nd(vals, nodes=nodes)
+    np.testing.assert_allclose(chebyshev_values_at_nodes_nd(coeffs, nodes=nodes), vals, rtol=1e-13, atol=1e-14)
+    # Only the chosen axes are transformed
+    partial = compute_chebyshev_coefficients_nd(vals, nodes=nodes, axes=(0, 2))
+    np.testing.assert_allclose(chebyshev_values_at_nodes_nd(partial, nodes=nodes, axes=(0, 2)), vals,
+                               rtol=1e-13, atol=1e-14)
+
+
+@pytest.mark.parametrize("nodes", ["Chebyshev", "GaussLobatto"])
+def test_values_at_nodes_match_direct_evaluation(nodes):
+    # Independent check: evaluate the series at the actual node positions
+    from chebyshevnd import chebyshev_values_at_nodes_nd
+    rng = np.random.default_rng(9)
+    coeffs = decaying_coeffs(rng, (6, 5))
+    node_fn = chebyshev_nodes if nodes == "Chebyshev" else chebyshev_gauss_lobatto_nodes
+    tx, ty = node_fn(6, -1.0, 1.0), node_fn(5, -1.0, 1.0)
+    expected = np.array([[direct_eval(coeffs, [x, y]) for y in ty] for x in tx])
+    np.testing.assert_allclose(chebyshev_values_at_nodes_nd(coeffs, nodes=nodes), expected, rtol=1e-13, atol=1e-14)
+
+
+def test_values_at_nodes_checks_arguments():
+    from chebyshevnd import chebyshev_values_at_nodes_nd
+    with pytest.raises(ValueError):
+        chebyshev_values_at_nodes_nd(np.ones((1, 4)), nodes="GaussLobatto")
+    with pytest.raises(ValueError):
+        chebyshev_values_at_nodes_nd(np.ones((4, 4)), nodes="bogus")

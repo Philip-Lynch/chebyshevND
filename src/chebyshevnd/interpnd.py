@@ -8,9 +8,16 @@ from .backend import array_namespace, to_numpy
 from .batch import ChebyshevBatch
 from .batched import precontract_tables
 from .batched import evaluate_batch as _evaluate_batch
+from .derivatives import differentiate_coefficients
 from .errors import OutOfDomainError, describe_out_of_domain
 from .kernels import evaluate_point
-from .utils import compute_chebyshev_coefficients_nd, prune_trailing_slices_greedy_nd
+from .utils import (
+    chebyshev_gauss_lobatto_nodes,
+    chebyshev_nodes,
+    chebyshev_values_at_nodes_nd,
+    compute_chebyshev_coefficients_nd,
+    prune_trailing_slices_greedy_nd,
+)
 
 _NODE_FAMILIES = ("Chebyshev", "GaussLobatto")
 
@@ -558,6 +565,240 @@ class ChebyshevInterpolantND:
                 raise KeyError(f"Axis index {key} out of range for {self.ndim} axes.")
             return int(key) % self.ndim
         raise TypeError(f"Axes are given by name or integer index, not {key!r}.")
+
+    # ------------------------------------------------------------ derivatives
+
+    def derivative(self, orders):
+        """
+        A partial derivative of the interpolant, as a new interpolant.
+
+        Differentiation happens in coefficient space, so it is exact for the
+        interpolating polynomial. The result composes with everything else:
+        it can be evaluated, precontracted, optimized and differentiated
+        again, and :meth:`values_at_nodes` gives its values on the sampling
+        grid.
+
+        Parameters
+        ----------
+        orders : sequence of int or mapping
+            The derivative order per axis, either one non-negative integer
+            per axis in axis order, e.g. ``(0, 1, 2)``, or a mapping from axis
+            name (or index) to order, e.g. ``{"u": 1, "e": 1}``, with
+            unlisted axes taken as 0.
+
+        Returns
+        -------
+        ChebyshevInterpolantND
+            The derivative with respect to the physical coordinates (the
+            factor ``2 / (b - a)`` per order is included), with the same
+            axes, outputs and domain. It is built from this interpolant's
+            truncated series (so it is the exact derivative of what
+            :meth:`evaluate` computes), and also from the full series if
+            that is still held.
+
+        Notes
+        -----
+        Each derivative loses roughly a factor N^2 of relative accuracy, for
+        N nodes on the differentiated axis, because it amplifies the
+        rounding noise in the coefficients. The error estimate therefore has
+        three parts:
+
+        - the trailing coefficients of the derivative itself;
+        - an exact bound on what this interpolant's truncation contributes;
+        - a rounding term, ``eps * max|c| * prod((N^2 * 2/(b - a))**order)``
+          over the differentiated axes.
+
+        The rounding term is deliberately conservative. It grows with N, so
+        for high derivatives more nodes eventually make the result worse.
+        Choose node counts for the highest derivative you need, and check
+        the estimate.
+        """
+        orders = self._parse_orders(orders)
+        compact = self._differentiate(self._coeffs, orders)
+        full = None if self._coeffs_full is None else self._differentiate(self._coeffs_full, orders)
+
+        # Differentiating removes the top `order` coefficients along each axis
+        keep = tuple(slice(max(k - o, 1)) for k, o in zip(self._kmax, orders))
+        if full is not None:
+            meaningful = tuple(slice(max(n - o, 1)) for n, o in zip(self._grid_shape, orders))
+            interp_error = _trailing_error_estimate(np.abs(full[meaningful]))
+            padded = np.zeros_like(full)
+            padded[tuple(slice(k) for k in self._kmax)] = compact
+            # Exact bound on what the truncation contributes to the derivative
+            truncation = np.abs(full - padded).reshape(-1, full.shape[-1]).sum(axis=0)
+        else:
+            interp_error = _trailing_error_estimate(np.abs(compact[keep]))
+            # Without the full series, scale the discarded sum by Markov's
+            # inequality, |p'| <= n^2 max|p| on [-1, 1] for degree n
+            factor = 1.0
+            for k, o, a, b in zip(self._kmax, orders, self._a, self._b):
+                factor *= (max(k - 1, 1) ** 2 * 2.0 / (b - a)) ** o
+            truncation = self._discarded * factor
+
+        # Rounding noise in the coefficients, amplified by the same Markov
+        # factor; it dominates once a function is resolved to rounding level
+        sizes = self._grid_shape if full is not None else self._kmax
+        amplification = 1.0
+        for n, o, a, b in zip(sizes, orders, self._a, self._b):
+            amplification *= (max(n - 1, 1) ** 2 * 2.0 / (b - a)) ** o
+        rounding = np.finfo(np.float64).eps * self._scale * amplification if any(orders) else 0.0
+
+        return ChebyshevInterpolantND._from_tables(
+            compact[keep], full, self._a, self._b,
+            nodes=self._nodes,
+            axis_names=self._axis_names,
+            output_names=self._output_names,
+            domain_tol=self._domain_tol,
+            abs_error=interp_error + truncation + rounding,
+            grid_shape=self._grid_shape,
+        )
+
+    def check_derivatives(self, orders, points, step=None):
+        """
+        Compare an analytic derivative with finite differences of this interpolant.
+
+        A routine sanity check for grid builds: the analytic derivative from
+        :meth:`derivative` should agree with central finite differences of
+        this interpolant, to the accuracy finite differences allow.
+
+        Parameters
+        ----------
+        orders : sequence of int or mapping
+            As for :meth:`derivative`. First derivatives, pure second
+            derivatives and mixed second derivatives are supported.
+        points : array-like, shape (n, d)
+            Points inside the domain at which to compare.
+        step : float, optional
+            Finite-difference step as a fraction of each axis's width.
+            Defaults to 1e-5 for first and 1e-4 for second derivatives,
+            near the optimum for float64.
+
+        Returns
+        -------
+        float or np.ndarray
+            ``max |analytic - finite difference| / max |analytic|`` over the
+            points (absolute if the derivative vanishes there), per function.
+            For a well-resolved table, expect around 1e-10 for first and 1e-8
+            for second derivatives (the limit of the finite differences);
+            much larger values indicate a problem.
+        """
+        orders = self._parse_orders(orders)
+        if sum(orders) not in (1, 2):
+            raise ValueError("check_derivatives() supports first and second derivatives only.")
+        pts = np.atleast_2d(np.asarray(points, dtype=np.float64))
+        if pts.shape[1] != self.ndim:
+            raise ValueError(f"points must have shape (n, {self.ndim}); got {pts.shape}.")
+        if step is None:
+            step = 1e-5 if sum(orders) == 1 else 1e-4
+        h = step * (self._b - self._a)
+
+        axes = [ax for ax, o in enumerate(orders) for _ in range(o)]
+        if len(axes) == 1 or axes[0] != axes[1]:
+            # Product of central differences, one per axis
+            stencil = [(1.0, [])]
+            for ax in axes:
+                stencil = [(w * s, shifts + [(ax, s)]) for w, shifts in stencil for s in (1.0, -1.0)]
+            denominator = np.prod([2.0 * h[ax] for ax in axes])
+        else:
+            ax = axes[0]
+            stencil = [(1.0, [(ax, 1.0)]), (-2.0, []), (1.0, [(ax, -1.0)])]
+            denominator = h[ax] ** 2
+
+        shifted = []
+        for _, shifts in stencil:
+            p = pts.copy()
+            for ax, s in shifts:
+                p[:, ax] += s * h[ax]
+            shifted.append(p)
+        # Evaluate without the domain check: stencils may step just outside
+        values, _ = _evaluate_batch(self._coeffs, self._a, self._b, np.concatenate(shifted), tol=np.inf)
+        values = values.reshape(len(stencil), len(pts), -1)
+        finite_diff = sum(w * v for (w, _), v in zip(stencil, values)) / denominator
+
+        analytic = self.derivative(orders).evaluate_batch(pts)
+        analytic = analytic.reshape(len(pts), -1)
+        scale = np.abs(analytic).max(axis=0)
+        scale = np.where(scale > 0, scale, 1.0)
+        discrepancy = np.abs(analytic - finite_diff).max(axis=0) / scale
+        return float(discrepancy[0]) if self._single else discrepancy
+
+    def values_at_nodes(self):
+        """
+        Values of the full series on the interpolant's own node grid.
+
+        For an interpolant built from samples, this reproduces the samples
+        (to rounding). For a derivative, it gives the derivative's values
+        at the nodes where the original function was sampled. That is the
+        build workflow for higher-order tables: fit F0, take
+        ``F0.derivative(...).values_at_nodes()``, combine with other values
+        at the same nodes (see :meth:`axis_nodes`), and fit the result.
+
+        Uses the full (untruncated) series and one inverse DCT.
+
+        Returns
+        -------
+        np.ndarray
+            Shape ``grid_shape`` for a single function, ``grid_shape + (F,)``
+            with a function axis, ordered like ``np.meshgrid(*axis_nodes(),
+            indexing='ij')``.
+
+        Raises
+        ------
+        RuntimeError
+            If the full tensor was dropped by ``optimize(keep_full=False)``.
+        """
+        if self._coeffs_full is None:
+            raise RuntimeError(
+                "values_at_nodes() needs the full coefficient tensor, which was dropped by "
+                "optimize(keep_full=False)."
+            )
+        vals = chebyshev_values_at_nodes_nd(self._coeffs_full, nodes=self._nodes, axes=range(self.ndim))
+        return vals[..., 0] if self._single else vals
+
+    def axis_nodes(self):
+        """
+        The node coordinates along each axis.
+
+        Returns
+        -------
+        tuple of np.ndarray
+            For each axis, its ``grid_shape`` nodes in the order the node
+            functions return them (descending), so that
+            ``np.meshgrid(*interp.axis_nodes(), indexing='ij')`` is the
+            sampling grid.
+        """
+        node_fn = chebyshev_nodes if self._nodes == "Chebyshev" else chebyshev_gauss_lobatto_nodes
+        return tuple(node_fn(n, a, b) for n, a, b in zip(self._grid_shape, self._a, self._b))
+
+    def _differentiate(self, coeffs, orders):
+        """Differentiate a coefficient tensor (trailing output axis included) by `orders`."""
+        for ax, order in enumerate(orders):
+            if order:
+                scale = (2.0 / (self._b[ax] - self._a[ax])) ** order
+                coeffs = differentiate_coefficients(coeffs, ax, order) * scale
+        return np.ascontiguousarray(coeffs)
+
+    def _parse_orders(self, orders):
+        """Turn a sequence or mapping of derivative orders into one int per axis."""
+        if hasattr(orders, "items"):
+            parsed = [0] * self.ndim
+            seen = set()
+            for key, order in orders.items():
+                ax = self._axis_position(key)
+                if ax in seen:
+                    raise ValueError(f"Axis {self._axis_names[ax]!r} appears more than once in orders.")
+                seen.add(ax)
+                parsed[ax] = order
+        else:
+            parsed = list(orders)
+            if len(parsed) != self.ndim:
+                raise ValueError(
+                    f"orders needs one entry per axis {self._axis_names}; got {len(parsed)}."
+                )
+        for order in parsed:
+            if not isinstance(order, numbers.Integral) or isinstance(order, bool) or order < 0:
+                raise ValueError(f"Derivative orders must be non-negative integers, got {order!r}.")
+        return tuple(int(o) for o in parsed)
 
     # ----------------------------------------------------- coefficients, errors
 

@@ -1,7 +1,7 @@
 # ChebyshevND — design document for the NIT / SEOBNRv6EPHM extension
 
-**Revision:** 3.2 (2026-11-09).
-- Steps 1 and 2 are implemented; §3 records what was built and where it
+**Revision:** 3.3 (2026-11-10).
+- Steps 1–3 are implemented; §3 records what was built and where it
   differs from the plan.
 - GPU support with CUDA via CuPy is now a requirement (§0.3, A8, D6).
 - The second consumer is an interpolated post-Minkowskian (PM) Hamiltonian
@@ -9,7 +9,7 @@
 - Step 0 is complete (v0.1.1).
 - §9 lists all revisions and maps the old step numbers to the new ones.
 
-**Branch:** `dev` (v0.1.1 plus Steps 1–2).
+**Branch:** `dev` (v0.1.1 plus Steps 1–3).
 
 **Purpose:** turn ChebyshevND from a 1D–4D single-function interpolator into the
 tabulation-and-evaluation backend for:
@@ -498,7 +498,10 @@ slowly). In a GPU batch, each member has its own fixed values.
 - 2b equals running 2a member by member (NumPy in CI; CuPy under
   `@pytest.mark.gpu`).
 
-### Step 3 — Analytic derivatives
+### Step 3 — Analytic derivatives — IMPLEMENTED
+
+Implemented on branch `step3-derivatives` (2026-11-10). "As built" below
+records where it differs from the design.
 
 **Why:** the 1PA/2PA tables are assembled at build time from first and
 mixed second derivatives of lower-order tables, evaluated at the grid nodes
@@ -526,6 +529,43 @@ conditions). This step is build-side and CPU-only.
   must be set by second-derivative accuracy.
 - `check_derivatives(points)`: compare against central finite differences of
   the interpolant itself. Run it routinely during grid builds, not once.
+
+**As built** (differences from the design above):
+- **`derivative(orders)`:**
+  - `orders` may also be a mapping, e.g. `{"u": 1, "e": 1}`.
+  - It differentiates the *truncated* series, so it is the exact
+    derivative of what `evaluate` computes, and that tensor shrinks by the
+    order along each differentiated axis. The full series is
+    differentiated too when it is held.
+  - The recurrence is public as `differentiate_coefficients(coeffs, axis,
+    order)`.
+- **No cache on the parent.** A derivative costs one pass over the tensor
+  per order, and a cached object could be changed by the caller (e.g. by
+  `optimize`), which would surprise later calls. Callers keep the object.
+- **The error estimate has three parts:**
+  - the derivative's trailing coefficients;
+  - an exact bound on the truncation's contribution,
+    `Σ|D(full) − D(truncated)|` (scaled by Markov's inequality when the full
+    tensor was dropped);
+  - a **rounding term**, `eps · max|c| · ∏ (N²·2/(b−a))^order`.
+
+  The rounding term was added because tests showed that for a function
+  resolved to rounding level, the second-derivative error is amplified
+  coefficient noise, which the trailing coefficients miss. On the test
+  function the estimate bounds the actual error in every case, by 1–100×.
+  Since it grows with N, more nodes eventually make high derivatives
+  worse.
+- **`values_at_nodes()`** uses the full series, via the new public
+  `chebyshev_values_at_nodes_nd`, the inverse of the coefficient DCT.
+- **`axis_nodes()`** (new) returns the node coordinates per axis, so other
+  quantities can be computed at the same nodes. A test runs the whole
+  build workflow (F⁽¹⁾ = ∂F⁽⁰⁾/∂y · g).
+- **`check_derivatives(orders, points, step=None)`:**
+  - supports first, pure second and mixed second derivatives;
+  - returns `max|analytic − FD| / max|analytic|` per output (typically
+    1e-10 for first and 1e-8 for second derivatives);
+  - evaluates its stencils without the domain check, so boundary points
+    work.
 
 **Tests:**
 - Derivatives of separable test functions to ~1e-10 (first) and ~1e-8
@@ -855,7 +895,7 @@ These change details of 1e, 2b and 4b, not the plan's structure.
 | 0 (done) | `interp3d.py`, `interp4d.py`, `clenshaw.py`, `utils.py`, `.github/workflows/tests.yml`, `benchmarks/`, README, docs, examples |
 | 1 (done) | new `kernels.py`, `interpnd.py`, `batched.py`, `backend.py`; `clenshaw.py` (`clenshaw_nd` on the kernel); `utils.py` (`axes=`); `__init__.py`; `docs/api.rst`; `benchmarks/bench_evaluate.py`; `pyproject.toml` (`gpu` extra and marker); tests `test_interpnd.py`, `test_batched.py`, `helpers.py` |
 | 2 (done) | `interpnd.py` (`precontract`, `precontract_batch`), `batched.py` (`precontract_tables`), new `batch.py` (`ChebyshevBatch`), new `errors.py`; `docs/api.rst`; benchmarks; tests `test_precontract.py` |
-| 3 | new `derivatives.py`, `utils.py` (inverse DCT), `interpnd.py` (`derivative`, `values_at_nodes`, `check_derivatives`) |
+| 3 (done) | new `derivatives.py` (`differentiate_coefficients`); `utils.py` (`chebyshev_values_at_nodes_nd`); `interpnd.py` (`derivative`, `values_at_nodes`, `axis_nodes`, `check_derivatives`); `docs/api.rst`; tests `test_derivatives.py` |
 | 4 | `kernels.py` (`eval_into`, `eval_grad_into`), `batched.py` (`value_and_grad_batch`), new `cuda_kernels.py` (RawKernel sources, moved from Step 1), `interpnd.py` (`raw`, `value_and_grad`) |
 | 5 | 5a: new `maps.py` (Numba and `xp` versions, `eval_grad_physical_into`, `value_and_grad_physical_batch`), `interpnd.py` (`evaluate_physical`); 5b: new `grid.py` |
 | 6 | new `io.py` (with device placement), `pyproject.toml` (`io` extra) |
@@ -865,6 +905,14 @@ These change details of 1e, 2b and 4b, not the plan's structure.
 ---
 
 ## 9. Revision history
+
+**Revision 3.3 (2026-11-10).** Step 3 implemented (branch
+`step3-derivatives`). Step 3 now records how it was built and where it
+differs from the plan:
+- no derivative cache on the parent;
+- a rounding term in the derivative error estimate;
+- `axis_nodes()`;
+- `check_derivatives` covers first and second orders.
 
 **Revision 3.2 (2026-11-09).** Step 2 implemented (branch
 `step2-precontraction`). Step 2 now records how it was built and where it

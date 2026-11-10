@@ -51,9 +51,16 @@ Coefficient computation
 
 .. autofunction:: chebyshevnd.compute_chebyshev_coefficients_nd
 
+.. autofunction:: chebyshevnd.chebyshev_values_at_nodes_nd
+
 .. autofunction:: chebyshevnd.renormalize_coefficients_Chebyshev
 
 .. autofunction:: chebyshevnd.renormalize_coefficients_GL
+
+Derivatives
+-----------
+
+.. autofunction:: chebyshevnd.differentiate_coefficients
 
 Clenshaw evaluation kernels
 ---------------------------
