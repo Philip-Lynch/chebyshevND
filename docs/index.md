@@ -17,7 +17,8 @@ pip install chebyshevnd
 ```
 
 Requires Python ≥ 3.10; `numpy`, `scipy`, and `numba` are installed
-automatically.
+automatically. The extras `chebyshevnd[io]` (h5py, for saving tables) and
+`chebyshevnd[gpu]` (CuPy, for NVIDIA GPUs) are optional.
 
 ## Quickstart
 
@@ -60,6 +61,14 @@ interp = ChebyshevInterpolant3D(vals,
 interp.evaluate(1.3, 0.5, 2.5)       # coordinates in the same order: x, y, z
 ```
 
+In any number of dimensions, and for several functions sampled on the same
+grid, use {class}`~chebyshevnd.ChebyshevInterpolantND`. It also provides
+precontraction (fixing some variables once for cheaper evaluations over the
+rest), derivatives and gradients, evaluation from Numba code and on the GPU,
+domain maps, sampling grids and HDF5 files; the
+[nD workflow notebook](examples/example_nd_workflow.ipynb) walks through
+them.
+
 ## Axis order and domain bounds
 
 Most wrong results come from mismatched orderings. On a square grid (the same
@@ -85,9 +94,10 @@ orderings consistent:
    `b` to `a`), and the coefficient computation relies on it. Sample at the
    nodes as returned; don't sort them.
 
-`evaluate` takes its coordinates in the same axis order. It does not check
-that they lie inside the domain: outside `[a, b]` the series extrapolates and
-quickly diverges.
+`evaluate` takes its coordinates in the same axis order. The 1D–4D classes do
+not check that they lie inside the domain: outside `[a, b]` the series
+extrapolates and quickly diverges. `ChebyshevInterpolantND` raises an
+`OutOfDomainError` instead.
 
 To catch mistakes early, use a different number of nodes on each axis, check
 that `vals.shape` is `(Nx, Ny, ...)`, and compare the interpolant with your

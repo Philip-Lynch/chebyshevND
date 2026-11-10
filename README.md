@@ -18,16 +18,29 @@ error estimates that come free from the coefficient decay.
 
 **Features**
 
-- Interpolant classes for 1D–4D (`ChebyshevInterpolant1D` … `ChebyshevInterpolant4D`)
+- `ChebyshevInterpolantND`: any number of dimensions, several real or complex
+  functions on one grid, named axes and outputs, and a domain check
+- Simple fixed-dimension classes for 1D–4D (`ChebyshevInterpolant1D` …
+  `ChebyshevInterpolant4D`)
 - Coefficients computed with a single fast DCT (`scipy.fft`), on either
   Chebyshev root nodes or Gauss–Lobatto (endpoint-including) nodes
-- Numba-jitted Clenshaw evaluation kernels, also usable standalone
-  (`clenshaw_1d` … `clenshaw_4d`, `clenshaw_nd`)
-- A-posteriori error estimates from trailing coefficient magnitudes
+- A-posteriori error estimates from trailing coefficient magnitudes, per
+  function and per axis
 - Structured pruning (`optimize`) that trims insignificant trailing
   coefficient slices under a global error budget
-- Dimension precomputation (`precompute_x`) for cheap repeated evaluation
-  when one variable is held fixed
+- **Precontraction**: fix some variables (e.g. the parameters of one
+  waveform) once, for much cheaper evaluations over the rest, also for a whole
+  batch of parameter values at once
+- **Derivatives**: exact partial derivatives as new interpolants, and the
+  value together with the full gradient at ~1.0–1.4× the cost of the value
+- **Compiled and GPU evaluation**: entry points callable from your own Numba
+  code (e.g. an ODE right-hand side), and batched evaluation on NumPy or, with
+  CuPy, on the GPU
+- **Domain maps** for regions that are not boxes (e.g. `u = 1/r`, or a
+  variable measured from a boundary that depends on other variables), with
+  derivatives in the physical variables
+- **Grids** for sampling expensive functions in parallel chunks, and **HDF5
+  files** with a documented layout to keep and share tables
 
 ## Installation
 
@@ -36,7 +49,14 @@ pip install chebyshevnd
 ```
 
 Requires Python ≥ 3.10, with `numpy`, `scipy`, and `numba` installed
-automatically. To install the development version from source:
+automatically. Optional extras:
+
+```bash
+pip install "chebyshevnd[io]"    # saving and loading tables (h5py)
+pip install "chebyshevnd[gpu]"   # batched evaluation on NVIDIA GPUs (CuPy, CUDA 12)
+```
+
+To install the development version from source:
 
 ```bash
 git clone https://github.com/Philip-Lynch/chebyshevND.git
@@ -92,8 +112,33 @@ interp.precompute_x(1.3)        # collapse x once ...
 interp.evaluate_yz(0.5, 2.5)    # ... then evaluate repeatedly in (y, z), ~3x faster
 ```
 
+In any number of dimensions, and for several functions at once, use
+`ChebyshevInterpolantND`. It takes one `(lower, upper)` pair per axis, and
+names for the axes and functions:
+
+```python
+from chebyshevnd import ChebyshevInterpolantND
+
+nu = chebyshev_nodes(10, 0.0, 0.25)
+u = chebyshev_nodes(24, -3.0, -1.0)
+e = chebyshev_nodes(14, 0.0, 0.6)
+NU, U, E = np.meshgrid(nu, u, e, indexing="ij")
+vals = np.stack([np.exp(-NU) * np.cos(U), E * np.sin(U)], axis=-1)   # two functions
+
+table = ChebyshevInterpolantND(vals, [(0.0, 0.25), (-3.0, -1.0), (0.0, 0.6)],
+                               axis_names=["nu", "u", "e"], output_names=["f", "g"])
+table.evaluate(0.1, -2.0, 0.3)                  # array([f, g])
+
+waveform = table.precontract({"nu": 0.1})       # fix nu once ...
+waveform.evaluate(-2.0, 0.3)                    # ... then evaluate over (u, e), much faster
+value, grad = waveform.value_and_grad(-2.0, 0.3)   # with the gradient along u and e
+```
+
 The [example notebooks](examples/) walk through each dimension, including
-convergence, coefficient decay, pruning, and precomputation timings.
+convergence, coefficient decay, pruning, and precomputation timings. The
+[nD workflow notebook](examples/example_nd_workflow.ipynb) covers
+precontraction, derivatives, Numba right-hand sides, domain maps, grids and
+files.
 
 ## Axis order and domain bounds
 
@@ -120,9 +165,10 @@ orderings consistent:
    `b` to `a`), and the coefficient computation relies on it. Sample at the
    nodes as returned; don't sort them.
 
-`evaluate` takes its coordinates in the same axis order. It does not check
-that they lie inside the domain: outside `[a, b]` the series extrapolates and
-quickly diverges.
+`evaluate` takes its coordinates in the same axis order. The 1D–4D classes do
+not check that they lie inside the domain: outside `[a, b]` the series
+extrapolates and quickly diverges. `ChebyshevInterpolantND` raises an
+`OutOfDomainError` instead.
 
 To catch mistakes early, use a different number of nodes on each axis, check
 that `vals.shape` is `(Nx, Ny, ...)`, and compare the interpolant with your
@@ -138,9 +184,13 @@ mistake does.
 2. **Coefficients.** The Chebyshev expansion coefficients are obtained with a
    single n-dimensional DCT (type II for root nodes, type I for Gauss–Lobatto),
    costing $O(M \log M)$ for $M$ grid points.
-3. **Evaluation.** The tensor series is evaluated with nested Clenshaw
-   recursions, compiled with Numba. Evaluation never reconstructs polynomial
-   values explicitly, which keeps it numerically stable.
+3. **Evaluation.** The 1D–4D classes evaluate the tensor series with nested
+   Clenshaw recursions. `ChebyshevInterpolantND` contracts the coefficient
+   tensor one axis at a time with the values of $T_k$ at the point, computed
+   by the stable three-term recurrence. Its first contraction is a sequence
+   of contiguous vector updates (and, for a batch of points, a single matrix
+   product), so its cost is dominated by one pass over the coefficients.
+   Both are compiled with Numba; batches also run on NumPy or CuPy.
 4. **Compression.** For smooth functions the coefficients decay geometrically
    along every axis, so most of the tensor is numerically irrelevant.
    `optimize` greedily discards trailing slices while keeping the summed
@@ -151,23 +201,23 @@ mistake does.
 
 ## Roadmap
 
-Planned for future releases:
-
-- Interpolants beyond 4D (5D/6D) via a generic n-dimensional kernel
-- Analytic partial derivatives of interpolants, evaluated efficiently through
-  the relationship between Chebyshev polynomials of the first and second kind
-- Precomputation over multiple leading dimensions for even cheaper repeated
-  evaluation
+- Validate and tune the GPU path on CUDA hardware (custom CUDA kernels where
+  benchmarks show kernel-launch overhead dominates)
+- Prefactors for tabulating functions with known singular factors, if a use
+  case needs them
 
 ## Development
 
 Run the test suite with:
 
 ```bash
-pip install -e .
+pip install -e ".[io]"
 pip install pytest
 pytest
 ```
+
+Tests of the GPU path are marked `gpu` and are skipped without CuPy and a
+CUDA device; on a machine with both, run them with `pytest -m gpu`.
 
 To compare per-call evaluation timings before and after a change (on the same
 machine):
