@@ -1,7 +1,7 @@
 # ChebyshevND — design document for the NIT / SEOBNRv6EPHM extension
 
-**Revision:** 3.3 (2026-11-10).
-- Steps 1–3 are implemented; §3 records what was built and where it
+**Revision:** 3.4 (2026-11-10).
+- Steps 1–4 are implemented; §3 records what was built and where it
   differs from the plan.
 - GPU support with CUDA via CuPy is now a requirement (§0.3, A8, D6).
 - The second consumer is an interpolated post-Minkowskian (PM) Hamiltonian
@@ -9,7 +9,7 @@
 - Step 0 is complete (v0.1.1).
 - §9 lists all revisions and maps the old step numbers to the new ones.
 
-**Branch:** `dev` (v0.1.1 plus Steps 1–3).
+**Branch:** `dev` (v0.1.1 plus Steps 1–4).
 
 **Purpose:** turn ChebyshevND from a 1D–4D single-function interpolator into the
 tabulation-and-evaluation backend for:
@@ -274,14 +274,19 @@ array namespace `xp`, chosen from the arrays passed in (NumPy or CuPy).
   `points`. They are either **shared** (`(k₁, …, k_d[, F])`) or **per member**
   (a leading batch axis `B`, produced by Step 2b).
 - **Basis values:** the three-term recurrence, vectorised over the batch.
-  - As implemented in Step 1e, this is a Python loop over `k` of array
-    operations, so on CuPy it launches one kernel per `k`.
+  - It is a Python loop over `k` of array operations, so on CuPy each
+    step is a kernel launch. Since Step 4b, all axes are computed together
+    and each step is two in-place operations, about `2·max(k)` launches for
+    T and as many again for T′ (previously about `3·Σk`).
   - Computing all axes' bases in a single `cupy.RawKernel` (CUDA C compiled
-    at run time by NVRTC, so no CUDA build step) is deferred to Step 4b. It
-    could not be compiled or tested without a CUDA machine, and GPU
-    benchmarks should justify it first.
-  - `cos(k·arccos t)` is not used: it loses about half the digits near
-    `t = ±1`.
+    at run time by NVRTC, so no CUDA build step) is deferred to the GPU
+    follow-up (Step 4b, as built). It could not be compiled or tested
+    without a CUDA machine, and GPU benchmarks should justify it first.
+  - Closed forms are not used. Checked against exact rational arithmetic
+    (Step 4b): `cos(k·arccos t)` is as accurate as the recurrence, but the
+    derivative `k·sin(kθ)/sin θ` is O(1) wrong at `t = −1` and loses digits
+    near it, and neither extrapolates outside `[−1, 1]` (flagged points and
+    `check_derivatives`' stencils need extrapolation).
 - **Contractions:**
   - For a shared table, the first axis is one GEMM and the rest are
     batched einsums on small arrays.
@@ -576,7 +581,10 @@ conditions). This step is build-side and CPU-only.
 - `values_at_nodes` round trip reproduces the input samples to 1e-14 for
   both node families.
 
-### Step 4 — Fused evaluation for the ODE RHS (values and gradients)
+### Step 4 — Fused evaluation for the ODE RHS (values and gradients) — IMPLEMENTED
+
+Implemented on branch `step4-fused-evaluation` (2026-11-10). "As built"
+below records where it differs from the design.
 
 **Why:** each Python-level interpolant call adds dispatch and glue around a
 µs-scale kernel, so the whole RHS should be one compiled function on the CPU,
@@ -627,6 +635,106 @@ needs the gradient at every call.
 
 **Portability:** A1–A3 and the self-describing schema (Step 6) keep a
 Cython/C port cheap as well, if plans change.
+
+**As built, 4a** (differences from the design above):
+- **API.**
+  - `raw()` returns a `RawTable(coeffs, shape, bounds, tol)` named tuple
+    of read-only views: a snapshot that a later `optimize()` does not
+    change. `bounds` is `(2, d)`, as in the internal kernels.
+  - `RawTable.workspace()` returns a `Workspace(scratch, work)` that
+    serves both entry points.
+  - The entry points take **flat arrays** in field order:
+    `eval_into(coeffs, shape, bounds, tol, x, scratch, work, out)`, and the
+    same for `eval_grad_into`, whose `out` is `(d + 1, F)` (row 0 the
+    values, row i + 1 the derivative along axis i). From Python,
+    `eval_into(*table, x, *ws, out)`.
+  - Why flat: Numba types array arguments in C but tuples in Python. A
+    jitted RHS that takes the named tuples costs about 1.5 µs more per call
+    from Python (2.5 µs vs 1.0 µs of kernel for a 30×20 table), against
+    about 0.5 µs for 8 arrays. `solve_ivp` (and pySEOBNR's integrator) call
+    the RHS from Python at every step. Numba 0.61 also cannot star-unpack a
+    named tuple inside `@njit` code.
+  - Both check the sizes of `x`, the workspace and `out`, and raise
+    `ValueError`: Numba does no bounds checking, so an undersized
+    workspace would corrupt memory.
+  - `value_and_grad(*xs)` returns `(value, grad)`, `grad` of shape `(d,)`,
+    or `(d, F)` with a function axis.
+- **Algorithm: branches instead of 1 + d finishing passes.** Contracting
+  axis i turns the value branch into two (with T and T′) in one pass over
+  its data, and contracts every existing derivative branch with T. Axis 0
+  is read once with two accumulators, and only the small partial sums are
+  touched more than once. The hot loops are written out by hand: calling a
+  helper for them cost 10–18%.
+- **Measured** (raw kernels from an `@njit` loop, single function):
+
+  | Table | Value | Value + gradient | Ratio |
+  |---|---|---|---|
+  | 30³ | 15.1 µs | 17.0 µs | 1.12 |
+  | 20³×10 | 43.1 µs | 49.3 µs | 1.14 |
+  | 40×30×30 | 19.9 µs | 22.1 µs | 1.11 |
+  | 30×20, F = 4 | 2.18 µs | 2.49 µs | 1.14 |
+  | 12⁴ | 11.8 µs | 14.2 µs | 1.20 |
+  | 10×24×16×6×6, F = 4 | 300 µs | 397 µs | 1.32 |
+  | 20³, complex | 8.5 µs | 11.9 µs | 1.40 |
+
+  That is 1.0–1.4×, against 2.0–2.1× for the prototype and the ≤ 2.5×
+  target. Through the Python methods (`evaluate` vs `value_and_grad`) the
+  ratio is 1.2–1.3×. The gradient agrees with Step 3's derivative tensors
+  to ~1e-15 relative.
+- **No Hessian** (`max_order=2`): there is no per-step use yet, and Step 3's
+  derivative interpolants cover one-off Hessians.
+- **Toy Kepler Hamiltonian.** `H(k, r, p_r, p_φ)` on a 3×40×4×5 grid,
+  `k` precontracted, Hamilton's equations from `eval_grad_into` in a
+  jitted RHS, DOP853 at `rtol = 1e-12` over ~2.6 orbits (1643 calls).
+  The interpolated energy drifts by 7e-13 and the orbit satisfies
+  `r = p / (1 + e cos φ)` to 5e-12.
+- **ODE RHS** (`bench_evaluate.py`): a toy 2-variable averaged RHS from a
+  (ν, u, e) = 10×30×20 table precontracted at ν, with 2 outputs, DOP853.
+
+  | Right-hand side | µs per call |
+  |---|---|
+  | trivial jitted RHS (integrator floor) | 3.6 |
+  | Python RHS calling `evaluate()` | 5.7 |
+  | jitted RHS calling `eval_into()` | 5.4 |
+
+  The table costs about 1 µs and the dispatch about 0.5 µs, so
+  `solve_ivp`'s own overhead dominates (§0.1). The next lever for a folded
+  NIT table is a compiled integrator, which is outside this package (§7).
+
+**As built, 4b** (differences from the design above):
+- **API.** `value_and_grad_batch(coeffs, a, b, points)` (module level)
+  returns `(values (B, F), grads (B, d, F), status)`. The class has
+  `value_and_grad_batch(points, return_status=False)`, and `ChebyshevBatch`
+  has `value_and_grad(points, return_status=False)`. Shapes drop the
+  function axis for a single function, as for `evaluate_batch`.
+- **Algorithm.** The same branches as 4a:
+  - For a shared table, the first axis is one GEMM,
+    `(2B, k₁) @ (k₁, rest)`, with the T and T′ rows of each point
+    interleaved.
+  - For per-member tables, the first axis is one batched GEMM,
+    `(B, 2, k₁) @ (B, k₁, rest)`, which reads each table once.
+  - Later axes are batched matrix products on the partial sums.
+- **Basis values.** `chebyshev_basis_batch` takes points of any shape and
+  `derivative=True`.
+  - All axes are computed together, up to the largest k.
+  - The arrays are stored k-first, so each step is two in-place
+    operations on contiguous memory.
+  - T′ comes from the second-kind polynomials, `T′_k = k·U_{k−1}`.
+
+  This cuts the array operations (GPU launches) from about `3·Σk` for
+  values and about `10·max(k)` for values + derivatives to about
+  `2·max(k)` and `4·max(k)`. On the CPU the bases are about 2.5× faster.
+- **No RawKernel, no fused kernel.** CUDA C cannot be compiled or tested
+  on the development Mac. Both wait for the GPU follow-up, together with
+  running `pytest -m gpu` and `bench_evaluate.py --gpu` (the batch-size
+  sweep is written and runs on NumPy).
+- **CPU cost.** A batched gradient costs 2–4× a batched value on NumPy,
+  unlike the Numba kernel. A shared table's first-axis GEMM is
+  compute-bound, so twice the rows cost twice the time, and the derivative
+  branches add contractions (`j + 2` at axis j). Per point, batched NumPy
+  is about as fast as the Numba loop (1.4–2.0 µs vs 2.1–2.2 µs per member
+  for B ≥ 100 in the sweep).
+- **GPU tests** (3) are written and have not been run.
 
 **Tests:**
 - `eval_into` and `eval_grad_into` called from inside a user `@njit`
@@ -805,7 +913,13 @@ on CPU and GPU.
   This means several multi-output tensors grouped by resolution, which keeps
   A3's contiguous layout and A8's fixed shapes.
 - Chebfun-style resolution diagnostics ("is this axis resolved?") per
-  function.
+  function. The current trailing-coefficient estimate (inherited from the
+  2D–4D classes) also takes the second-to-last slice, to guard against
+  parity zeros. It therefore overstates the error badly on axes where the
+  function is an exact low-degree polynomial sampled with only one or two
+  nodes to spare. For example, the Kepler table of Step 4 (linear in `k`
+  on 3 nodes, quadratic in `p_r` on 4) reports a relative error of 1.07
+  against an actual 9e-16.
 - A benchmarks notebook covering:
   - cost vs dimension, vs F and vs precontraction;
   - derivative accuracy vs N;
@@ -896,7 +1010,7 @@ These change details of 1e, 2b and 4b, not the plan's structure.
 | 1 (done) | new `kernels.py`, `interpnd.py`, `batched.py`, `backend.py`; `clenshaw.py` (`clenshaw_nd` on the kernel); `utils.py` (`axes=`); `__init__.py`; `docs/api.rst`; `benchmarks/bench_evaluate.py`; `pyproject.toml` (`gpu` extra and marker); tests `test_interpnd.py`, `test_batched.py`, `helpers.py` |
 | 2 (done) | `interpnd.py` (`precontract`, `precontract_batch`), `batched.py` (`precontract_tables`), new `batch.py` (`ChebyshevBatch`), new `errors.py`; `docs/api.rst`; benchmarks; tests `test_precontract.py` |
 | 3 (done) | new `derivatives.py` (`differentiate_coefficients`); `utils.py` (`chebyshev_values_at_nodes_nd`); `interpnd.py` (`derivative`, `values_at_nodes`, `axis_nodes`, `check_derivatives`); `docs/api.rst`; tests `test_derivatives.py` |
-| 4 | `kernels.py` (`eval_into`, `eval_grad_into`), `batched.py` (`value_and_grad_batch`), new `cuda_kernels.py` (RawKernel sources, moved from Step 1), `interpnd.py` (`raw`, `value_and_grad`) |
+| 4 (done) | `kernels.py` (`value_and_grad_point`, `eval_into`, `eval_grad_into`, `RawTable`, `Workspace`), `batched.py` (`value_and_grad_batch`, basis rewrite), `batch.py` (`value_and_grad`), `interpnd.py` (`raw`, `value_and_grad`, `value_and_grad_batch`); `docs/api.rst`; benchmarks; tests `test_fused.py`. `cuda_kernels.py` (RawKernel) deferred to the GPU follow-up |
 | 5 | 5a: new `maps.py` (Numba and `xp` versions, `eval_grad_physical_into`, `value_and_grad_physical_batch`), `interpnd.py` (`evaluate_physical`); 5b: new `grid.py` |
 | 6 | new `io.py` (with device placement), `pyproject.toml` (`io` extra) |
 | 7 | new `prefactors.py` |
@@ -905,6 +1019,19 @@ These change details of 1e, 2b and 4b, not the plan's structure.
 ---
 
 ## 9. Revision history
+
+**Revision 3.4 (2026-11-10).** Step 4 implemented (branch
+`step4-fused-evaluation`). Step 4 now records how it was built and where it
+differs from the plan:
+- flat-array entry points (Numba dispatches tuples slowly);
+- the branch scheme, at 1.0–1.4× a value evaluation;
+- no Hessian;
+- the batched basis rewrite;
+- no RawKernel until GPU testing;
+- measured timings, including the ODE RHS benchmark.
+
+A8 now records the closed-form basis check. Step 8 notes the error
+estimate's weakness on low-degree polynomial axes.
 
 **Revision 3.3 (2026-11-10).** Step 3 implemented (branch
 `step3-derivatives`). Step 3 now records how it was built and where it

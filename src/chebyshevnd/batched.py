@@ -20,6 +20,8 @@ points outside the domain. Instead, they return a per-point status bitmask.
 """
 
 import math
+from dataclasses import dataclass
+from typing import Any
 
 from .backend import array_namespace
 
@@ -28,32 +30,71 @@ from .backend import array_namespace
 DEFAULT_MAX_CHUNK_BYTES = 1 << 28
 
 
-def chebyshev_basis_batch(ts, n, xp):
+def chebyshev_basis_batch(ts, n, xp, derivative=False):
     """
     Chebyshev polynomials T_0, ..., T_{n-1} at each point of ``ts``.
 
     Parameters
     ----------
-    ts : array, shape (B,)
-        Points in [-1, 1].
+    ts : array
+        Points in [-1, 1], any shape, e.g. (B,) for one axis or (B, d) for
+        every axis of a batch at once (fewer, larger array operations, which
+        matters on the GPU).
     n : int
         Number of polynomials.
     xp : module
         ``numpy`` or ``cupy``.
+    derivative : bool, optional
+        Also return the derivatives T'_k(t).
 
     Returns
     -------
-    array, shape (B, n)
-        ``T[b, k] = T_k(ts[b])``, from the three-term recurrence, which keeps
-        full accuracy near +-1 (unlike ``cos(k * arccos(t))``).
+    T : array, shape ``ts.shape + (n,)``
+        ``T[..., k] = T_k(ts)``, from the three-term recurrence, which keeps
+        full accuracy near +-1.
+    D : array, shape ``ts.shape + (n,)``
+        Only if ``derivative``: ``D[..., k] = T'_k(ts) = k U_{k-1}(ts)``,
+        with the Chebyshev polynomials of the second kind U_k from the same
+        recurrence (no division, so t = +-1 needs no special case).
+
+    Notes
+    -----
+    The results are views of arrays stored with k as the leading axis, so
+    that each step of the recurrence is two in-place operations on
+    contiguous memory: about 2n array operations for T and 2n more for D,
+    each a kernel launch on the GPU. The closed forms ``T_k = cos(k theta)``
+    and ``T'_k = k sin(k theta) / sin(theta)``, with ``theta = arccos(t)``,
+    would need fewer. The first is as accurate as the recurrence, but the
+    second loses digits near t = -1, where theta is close to pi (and
+    ``sin(pi)`` is not 0 in floating point), and neither extrapolates
+    outside [-1, 1].
     """
-    T = xp.empty((ts.shape[0], n), dtype=ts.dtype)
-    T[:, 0] = 1.0
+    T = _recurrence(ts, n, ts, xp)
+    if not derivative:
+        return xp.moveaxis(T, 0, -1)
+    D = xp.empty_like(T)
+    D[0] = 0.0
     if n > 1:
-        T[:, 1] = ts
+        U = _recurrence(ts, n - 1, 2.0 * ts, xp)
+        k = xp.arange(1, n, dtype=ts.dtype).reshape((n - 1,) + (1,) * ts.ndim)
+        xp.multiply(k, U, out=D[1:])
+    return xp.moveaxis(T, 0, -1), xp.moveaxis(D, 0, -1)
+
+
+def _recurrence(ts, n, first, xp):
+    """
+    P_0 = 1, P_1 = ``first``, P_k = 2 t P_{k-1} - P_{k-2}, stacked along a new
+    leading axis: T_k for ``first = t``, U_k for ``first = 2 t``.
+    """
+    P = xp.empty((n,) + ts.shape, dtype=ts.dtype)
+    P[0] = 1.0
+    if n > 1:
+        P[1] = first
+        two_t = 2.0 * ts
         for k in range(2, n):
-            T[:, k] = 2.0 * ts * T[:, k - 1] - T[:, k - 2]
-    return T
+            xp.multiply(two_t, P[k - 1], out=P[k])
+            xp.subtract(P[k], P[k - 2], out=P[k])
+    return P
 
 
 def evaluate_batch(coeffs, a, b, points, tol=1e-12, max_chunk_bytes=DEFAULT_MAX_CHUNK_BYTES):
@@ -85,7 +126,112 @@ def evaluate_batch(coeffs, a, b, points, tol=1e-12, max_chunk_bytes=DEFAULT_MAX_
     status : int64 array, shape (B,)
         Bit i of ``status[j]`` is set when coordinate i of point j lies
         outside its domain (beyond ``tol``) or is NaN; 0 means inside.
+
+    See Also
+    --------
+    value_and_grad_batch : the values together with their gradients.
     """
+    batch = _prepare(coeffs, a, b, points, tol)
+    xp, ts, k = batch.xp, batch.ts, batch.k
+    n_points = ts.shape[0]
+    if n_points == 0:
+        return xp.empty((0, batch.n_out), dtype=batch.dtype), batch.status
+
+    if batch.per_member:
+        bases = _axis_bases(ts, k, xp)
+        values = _contract_axes(batch.table.reshape(n_points, k[0], -1), bases, 0, xp)
+    else:
+        flat = batch.table.reshape(k[0], -1)
+        rows = max(1, max_chunk_bytes // (flat.shape[1] * flat.itemsize))
+        chunks = []
+        for start in range(0, n_points, rows):
+            bases = _axis_bases(ts[start:start + rows], k, xp)
+            # The first axis of a shared table is one GEMM over the chunk
+            chunks.append(_contract_axes(bases[0] @ flat, bases, 1, xp))
+        values = chunks[0] if len(chunks) == 1 else xp.concatenate(chunks, axis=0)
+    return batch.finish(values), batch.status
+
+
+def value_and_grad_batch(coeffs, a, b, points, tol=1e-12, max_chunk_bytes=DEFAULT_MAX_CHUNK_BYTES):
+    """
+    Evaluate a compact Chebyshev table and its gradient at a batch of points.
+
+    The batched form of :func:`chebyshevnd.eval_grad_into`. Each
+    axis is contracted with both T and T'; the first axis of the table is
+    read once (a single GEMM, or batched GEMM for per-member tables), and
+    the derivative branches only touch the much smaller partial sums.
+
+    Parameters
+    ----------
+    coeffs, a, b, points, tol, max_chunk_bytes
+        As for :func:`evaluate_batch`.
+
+    Returns
+    -------
+    values : array, shape (B, F)
+        The table evaluated at each point.
+    grads : array, shape (B, d, F)
+        ``grads[j, i]`` is the derivative of every output with respect to
+        coordinate i (in the domain's units), at point j.
+    status : int64 array, shape (B,)
+        As for :func:`evaluate_batch`.
+    """
+    batch = _prepare(coeffs, a, b, points, tol)
+    xp, ts, k = batch.xp, batch.ts, batch.k
+    n_points, d = ts.shape
+    if n_points == 0:
+        return (xp.empty((0, batch.n_out), dtype=batch.dtype),
+                xp.empty((0, d, batch.n_out), dtype=batch.dtype), batch.status)
+
+    if batch.per_member:
+        bases = _axis_bases(ts, k, xp, derivative=True)
+        branches = _contract_axes_with_gradient(batch.table.reshape(n_points, 1, -1), bases, 0, xp)
+    else:
+        flat = batch.table.reshape(k[0], -1)
+        # The intermediate holds two rows per point: value and first derivative
+        rows = max(1, max_chunk_bytes // (2 * flat.shape[1] * flat.itemsize))
+        chunks = []
+        for start in range(0, n_points, rows):
+            bases = _axis_bases(ts[start:start + rows], k, xp, derivative=True)
+            T, D = bases[0]
+            m = T.shape[0]
+            # First axis: one GEMM for both, (2m, k_1) @ (k_1, rest)
+            both = xp.stack([T, D], axis=1).reshape(2 * m, k[0])
+            partial = (both @ flat).reshape(m, 2, -1)
+            chunks.append(_contract_axes_with_gradient(partial, bases, 1, xp))
+        branches = chunks[0] if len(chunks) == 1 else xp.concatenate(chunks, axis=0)
+
+    branches = batch.finish(branches)
+    scale = 2.0 / (batch.b - batch.a)
+    return xp.ascontiguousarray(branches[:, 0]), branches[:, 1:] * scale[None, :, None], batch.status
+
+
+@dataclass
+class _Batch:
+    """Validated inputs of a batched evaluation, made by :func:`_prepare`."""
+
+    xp: Any
+    table: Any  # coefficients, complex ones viewed as interleaved float64
+    ts: Any  # points mapped to [-1, 1], shape (B, d)
+    a: Any
+    b: Any
+    status: Any
+    k: tuple  # coefficients per axis
+    n_out: int
+    per_member: bool
+    is_complex: bool
+    dtype: Any
+
+    def finish(self, values):
+        """Turn a contracted real array back into the table's dtype."""
+        values = self.xp.ascontiguousarray(values)
+        if self.is_complex:
+            values = values.view(self.xp.complex128)
+        return values
+
+
+def _prepare(coeffs, a, b, points, tol):
+    """Validate the inputs of a batched evaluation and map the points to [-1, 1]."""
     xp = array_namespace(coeffs, points)
     points = xp.asarray(points, dtype=xp.float64)
     if points.ndim != 2:
@@ -116,45 +262,74 @@ def evaluate_batch(coeffs, a, b, points, tol=1e-12, max_chunk_bytes=DEFAULT_MAX_
     weights = xp.asarray([1 << i for i in range(d)], dtype=xp.int64)
     status = (outside * weights).sum(axis=1)
 
-    k = coeffs.shape[1:-1] if per_member else coeffs.shape[:-1]
-    n_out = coeffs.shape[-1]
-    if n_points == 0:
-        return xp.empty((0, n_out), dtype=dtype), status
-
-    # Interleave real and imaginary parts so every product below is real
-    table = coeffs.view(xp.float64) if is_complex else coeffs
-
-    if per_member:
-        values = _contract_axes(table.reshape(n_points, k[0], -1), ts, k, 0, xp)
-    else:
-        flat = table.reshape(k[0], -1)
-        rows = max(1, max_chunk_bytes // (flat.shape[1] * flat.itemsize))
-        chunks = []
-        for start in range(0, n_points, rows):
-            t = ts[start:start + rows]
-            # The first axis of a shared table is one GEMM over the chunk
-            partial = chebyshev_basis_batch(t[:, 0], k[0], xp) @ flat
-            chunks.append(_contract_axes(partial, t, k, 1, xp))
-        values = chunks[0] if len(chunks) == 1 else xp.concatenate(chunks, axis=0)
-
-    values = xp.ascontiguousarray(values)
-    if is_complex:
-        values = values.view(xp.complex128)
-    return values, status
+    return _Batch(
+        xp=xp, ts=ts, a=a, b=b, status=status, per_member=per_member, is_complex=is_complex,
+        dtype=dtype, n_out=coeffs.shape[-1],
+        k=coeffs.shape[1:-1] if per_member else coeffs.shape[:-1],
+        # Interleave real and imaginary parts so every product stays real
+        table=coeffs.view(xp.float64) if is_complex else coeffs,
+    )
 
 
-def _contract_axes(partial, ts, k, first, xp):
+def _axis_bases(ts, k, xp, derivative=False):
+    """
+    Per-axis Chebyshev values (and derivatives) for points ``ts`` of shape (B, d).
+
+    All axes are computed together, up to the largest k, so the number of
+    array operations does not grow with d. Returns a list with, for each
+    axis, T of shape (B, k[ax]), or the pair (T, D) if ``derivative``.
+    """
+    n = max(k)
+
+    def axis(P, ax):
+        # Contiguous (B, k) blocks, so the matrix products below can use BLAS
+        return xp.ascontiguousarray(P[:, ax, :k[ax]])
+
+    if derivative:
+        T, D = chebyshev_basis_batch(ts, n, xp, derivative=True)
+        return [(axis(T, ax), axis(D, ax)) for ax in range(len(k))]
+    T = chebyshev_basis_batch(ts, n, xp)
+    return [axis(T, ax) for ax in range(len(k))]
+
+
+def _contract_axes(partial, bases, first, xp):
     """
     Contract axes ``first, ..., d-1`` of a per-point array.
 
     ``partial`` has shape (B, ...), whose remaining axes flatten to
-    (k[first], ..., k[d-1], F); the result has shape (B, F).
+    (k[first], ..., k[d-1], F); ``bases[ax]`` has shape (B, k[ax]). The
+    result has shape (B, F).
     """
     n_points = partial.shape[0]
-    for ax in range(first, len(k)):
-        basis = chebyshev_basis_batch(ts[:, ax], k[ax], xp)
-        partial = partial.reshape(n_points, k[ax], -1)
+    for ax in range(first, len(bases)):
+        basis = bases[ax]
+        partial = partial.reshape(n_points, basis.shape[1], -1)
         partial = xp.matmul(basis[:, None, :], partial)[:, 0, :]
+    return partial
+
+
+def _contract_axes_with_gradient(partial, bases, first, xp):
+    """
+    Contract axes ``first, ..., d-1``, keeping the derivative along each.
+
+    ``partial`` has shape (B, n_branches, ...): branch 0 is the value and
+    branch i + 1 the derivative along axis i, for every axis before
+    ``first``; the remaining axes flatten to (k[first], ..., k[d-1], F).
+    ``bases[ax]`` is the pair (T, D), each of shape (B, k[ax]). The value
+    branch is contracted with T and D in one batched GEMM; the other
+    branches with T only. The result has shape (B, d + 1, F).
+    """
+    n_points = partial.shape[0]
+    for ax in range(first, len(bases)):
+        T, D = bases[ax]
+        n_branches = partial.shape[1]
+        partial = partial.reshape(n_points, n_branches, T.shape[1], -1)
+        both = xp.matmul(xp.stack([T, D], axis=1), partial[:, 0])  # (B, 2, rest)
+        if n_branches == 1:
+            partial = both
+            continue
+        others = xp.matmul(T[:, None, None, :], partial[:, 1:])[:, :, 0, :]
+        partial = xp.concatenate([both[:, :1], others, both[:, 1:]], axis=1)
     return partial
 
 
