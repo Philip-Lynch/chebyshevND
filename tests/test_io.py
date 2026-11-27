@@ -1,5 +1,7 @@
 """Tests for saving and loading tables (Step 6)."""
 
+import os
+import platform
 import sys
 
 import numpy as np
@@ -280,6 +282,46 @@ def test_cuda_without_cupy(tmp_path, monkeypatch):
     monkeypatch.setitem(sys.modules, "cupy", None)
     with pytest.raises(ImportError, match=r"chebyshevnd\[gpu\]"):
         load(tmp_path / "t.h5", device="cuda")
+
+
+# ------------------------------------------------------ old files (version 1)
+
+FIXTURE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
+
+
+@pytest.mark.parametrize("name", ["plain", "plain32", "single", "mapped"])
+def test_version_1_files_load_bit_for_bit(name):
+    """
+    Files written by format version 1 (tests/data/make_v1_fixture.py, run
+    with the code before blocked tables existed) load with the same
+    coefficients and evaluate as they did then.
+    """
+    ref = np.load(os.path.join(FIXTURE, "v1_reference.npz"))
+    with h5py.File(os.path.join(FIXTURE, "v1_tables.h5"), "r") as f:
+        assert int(f[name].attrs["format_version"]) == 1
+        obj = load(f[name])
+    table = obj.table if isinstance(obj, MappedInterpolant) else obj
+    r = {key.split("/", 1)[1]: ref[key] for key in ref.files if key.startswith(name + "/")}
+    np.testing.assert_array_equal(table.get_coefficients(), r["coeffs"])
+    assert table.kmax == tuple(r["kmax"])
+    np.testing.assert_array_equal(np.atleast_1d(table.absolute_error()), r["abs_error"])
+
+    pts = r["points"]
+    evaluate = np.array([np.atleast_1d(obj.evaluate(*p)) for p in pts])
+    grads = [obj.value_and_grad(*p) for p in pts]
+    vg_value = np.array([np.atleast_1d(v) for v, _ in grads])
+    vg_grad = np.array([g for _, g in grads])
+    batch = np.asarray(obj.evaluate_batch(pts))
+    if str(ref["platform"]) == f"{sys.platform}-{platform.machine()}":
+        # Same platform as the writer: the compiled kernels give the same bits
+        np.testing.assert_array_equal(evaluate, r["evaluate"])
+        np.testing.assert_array_equal(vg_value, r["vg_value"])
+        np.testing.assert_array_equal(vg_grad, r["vg_grad"])
+    else:
+        for new, old in ((evaluate, "evaluate"), (vg_value, "vg_value"), (vg_grad, "vg_grad")):
+            np.testing.assert_allclose(new, r[old], rtol=1e-14, atol=1e-15)
+    # BLAS results may differ in the last bits between libraries and sizes
+    np.testing.assert_allclose(batch, r["batch"], rtol=1e-13, atol=1e-15)
 
 
 # ------------------------------------------------------------------- GPU
