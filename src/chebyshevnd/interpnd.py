@@ -801,12 +801,7 @@ class ChebyshevInterpolantND:
             truncation = np.abs(full - padded).reshape(-1, full.shape[-1]).sum(axis=0)
         else:
             interp_error = _trailing_error_estimate(np.abs(compact[keep]))
-            # Without the full series, scale the discarded sum by Markov's
-            # inequality, |p'| <= n^2 max|p| on [-1, 1] for degree n
-            factor = 1.0
-            for k, o, a, b in zip(self._kmax, orders, self._a, self._b):
-                factor *= (max(k - 1, 1) ** 2 * 2.0 / (b - a)) ** o
-            truncation = self._discarded * factor
+            truncation = self._discarded * self._markov_factor(orders)
 
         # Rounding noise in the coefficients, amplified by the same Markov
         # factor; it dominates once a function is resolved to rounding level
@@ -942,6 +937,20 @@ class ChebyshevInterpolantND:
         """
         node_fn = chebyshev_nodes if self._nodes == "Chebyshev" else chebyshev_gauss_lobatto_nodes
         return tuple(node_fn(n, a, b) for n, a, b in zip(self._grid_shape, self._a, self._b))
+
+    def _markov_factor(self, orders):
+        """
+        How much a derivative of order ``orders`` can amplify the discarded coefficients.
+
+        The discarded coefficients have degree up to N_i - 1 on axis i (N_i
+        nodes), so by Markov's inequality, ``|p'| <= n^2 max|p|`` on [-1, 1]
+        for degree n, each order on axis i multiplies their bound by at most
+        ``(N_i - 1)^2 * 2 / (b_i - a_i)``.
+        """
+        factor = 1.0
+        for n, o, a, b in zip(self._grid_shape, orders, self._a, self._b):
+            factor *= (max(n - 1, 1) ** 2 * 2.0 / (b - a)) ** o
+        return factor
 
     def _differentiate(self, coeffs, orders):
         """Differentiate a coefficient tensor (trailing output axis included) by `orders`."""

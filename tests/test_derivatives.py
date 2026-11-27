@@ -4,7 +4,7 @@ import numpy as np
 import pytest
 from numpy.polynomial import chebyshev as npcheb
 
-from chebyshevnd import ChebyshevInterpolantND, differentiate_coefficients
+from chebyshevnd import ChebyshevInterpolantND, chebyshev_nodes, differentiate_coefficients
 from helpers import decaying_coeffs, sample_on_grid
 
 DOMAINS = [(0.0, 1.5), (-1.0, 1.0), (0.5, 2.0)]
@@ -160,6 +160,19 @@ def test_derivative_without_full_tensor_uses_markov_bound():
         deriv.get_coefficients(full=True)
     actual = max(abs(deriv.evaluate(*p) - EXACT[(1, 0, 0)](*p)) for p in random_points(40))
     assert actual <= deriv.absolute_error()
+
+
+@pytest.mark.parametrize("order", [1, 2])
+def test_markov_bound_covers_the_degree_of_the_discarded_coefficients(order):
+    # f = 1 + 1e-6 T_9: optimize drops T_9, whose derivative reaches
+    # 1e-6 * 81 at x = 1 (and 1e-6 * 81 * 80 / 3 for the second). The bound
+    # must use the degree of what was discarded (9), not of what was kept (0).
+    x = chebyshev_nodes(10, -1.0, 1.0)
+    nd = ChebyshevInterpolantND(1.0 + 1e-6 * np.cos(9 * np.arccos(x)), [(-1.0, 1.0)])
+    nd.optimize(1e-5, keep_full=False)
+    assert nd.kmax == (1,)
+    actual = 1e-6 * (81.0 if order == 1 else 81.0 * 80.0 / 3.0)
+    assert actual <= nd.derivative([order]).absolute_error()
 
 
 def test_order_beyond_degree_gives_zero():
