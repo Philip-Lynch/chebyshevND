@@ -154,7 +154,7 @@ class ChebyshevInterpolantND:
         self._coeffs_full = np.ascontiguousarray(coeffs)
 
         abs_c = np.abs(self._coeffs_full)
-        self._scale = abs_c.reshape(-1, n_out).max(axis=0)
+        self._scale_value = abs_c.reshape(-1, n_out).max(axis=0)
         self._interp_error = _trailing_error_estimate(abs_c)
         self._discarded = np.zeros(n_out)
         self._discarded_l2 = np.zeros(n_out)
@@ -167,7 +167,7 @@ class ChebyshevInterpolantND:
     @classmethod
     def _from_tables(cls, coeffs, coeffs_full, a, b, *, nodes, axis_names, output_names,
                      domain_tol, abs_error, grid_shape, discarded=None, scale=None,
-                     discarded_l2=None, truncation=None, dtype=None):
+                     discarded_l2=None, truncation=None, dtype=None, flat=None):
         """
         Build an interpolant directly from coefficient tensors, e.g. the result
         of a precontraction, or a table read from a file.
@@ -183,7 +183,8 @@ class ChebyshevInterpolantND:
         computed from the coefficients), ``discarded_l2`` (default zero) and
         ``truncation`` (the settings of the ``optimize`` that made the table)
         restore a saved table exactly. ``dtype`` is needed only for a blocked
-        table with no blocks.
+        table with no blocks. ``flat``, for a blocked table, is a buffer that
+        already holds its blocks one after the other (see ``pack_blocks``).
         """
         self = cls.__new__(cls)
         self._single = len(output_names) == 0
@@ -205,21 +206,16 @@ class ChebyshevInterpolantND:
             dtype = blocks[0][0].dtype
         elif self._coeffs_full is not None:
             dtype = self._coeffs_full.dtype
-        if scale is not None:
-            self._scale = np.array(scale, dtype=np.float64)
-        elif self._coeffs_full is not None:
-            self._scale = np.abs(self._coeffs_full).reshape(-1, n_out).max(axis=0)
-        else:
-            self._scale = np.zeros(n_out)
-            for c, o in blocks:
-                self._scale[o] = np.abs(c).reshape(-1, len(o)).max(axis=0)
+        # Without a given scale, it is computed on first use (see _scale): a
+        # pass over the coefficients that precontraction need not pay for
+        self._scale_value = None if scale is None else np.array(scale, dtype=np.float64)
         self._interp_error = np.array(abs_error, dtype=np.float64)
         self._discarded = np.zeros(n_out) if discarded is None else np.array(discarded, dtype=np.float64)
         self._discarded_l2 = (np.zeros(n_out) if discarded_l2 is None
                               else np.array(discarded_l2, dtype=np.float64))
         self._truncation = truncation
         self._x = np.empty(self._a.shape[0])
-        self._set_blocks(blocks, n_out, dtype)
+        self._set_blocks(blocks, n_out, dtype, flat=flat)
         return self
 
     def _set_truncation(self, kmax):
@@ -231,7 +227,7 @@ class ChebyshevInterpolantND:
         n_out = coeffs.shape[-1]
         self._set_blocks([(coeffs, np.arange(n_out, dtype=np.int64))], n_out, coeffs.dtype)
 
-    def _set_blocks(self, blocks, n_out, dtype):
+    def _set_blocks(self, blocks, n_out, dtype, flat=None):
         """
         Make ``blocks`` the evaluation tables: ``(coeffs, outputs)`` pairs,
         each ``coeffs`` of shape (k_1, ..., k_d, F_b) with the output index
@@ -241,6 +237,8 @@ class ChebyshevInterpolantND:
         and evaluated as before blocks existed (A2). Anything else is a
         *blocked* table: every block becomes a view into one flat array, the
         layout of the blocked kernels, and outputs in no block are zero.
+        ``flat``, if given, already holds the blocks one after the other and
+        becomes that array, without a copy.
         """
         d = len(self._grid_shape)
         self._n_out = int(n_out)
@@ -259,7 +257,7 @@ class ChebyshevInterpolantND:
             self._scratch = np.empty(len(self._kmax) + max(self._kmax))
             self._work = np.empty((2, rest), dtype=self._dtype)
         else:
-            packed = pack_blocks(blocks, d, self._dtype)
+            packed = pack_blocks(blocks, d, self._dtype, flat=flat)
             flat, offsets = packed[0], packed[1]
             self._blocks = tuple((flat[offsets[i]:offsets[i + 1]].reshape(c.shape), o)
                                  for i, (c, o) in enumerate(blocks))
@@ -278,6 +276,25 @@ class ChebyshevInterpolantND:
         self._fixed_first = {}
         # Buffers for value_and_grad, allocated on first use
         self._grad_buffers = None
+
+    @property
+    def _scale(self):
+        """
+        The largest coefficient magnitude per output, from the full tensor
+        if it is held, otherwise from the stored blocks (zero for outputs in
+        none). Computed on first use. ``optimize`` reads it before it
+        replaces the blocks or drops the full tensor, so the value never
+        depends on when it is first needed.
+        """
+        if self._scale_value is None:
+            if self._coeffs_full is not None:
+                scale = np.abs(self._coeffs_full).reshape(-1, self._n_out).max(axis=0)
+            else:
+                scale = np.zeros(self._n_out)
+                for c, o in self._blocks:
+                    scale[o] = np.abs(c).reshape(-1, len(o)).max(axis=0)
+            self._scale_value = scale
+        return self._scale_value
 
     @property
     def _untruncated(self):
@@ -783,9 +800,18 @@ class ChebyshevInterpolantND:
                     "precontract() takes one value per fixed axis; use precontract_batch() for arrays."
                 )
         row = np.array([values], dtype=np.float64)
+        flat = None
+        if not self._dense:
+            # Write the blocks of the result straight into the one array the
+            # blocked kernels use, rather than copying them there afterwards
+            shapes = [tuple(k for i, k in enumerate(c.shape[:-1]) if i not in axes) + (c.shape[-1],)
+                      for c, _ in self._blocks]
+            ends = np.cumsum([0] + [int(np.prod(shape)) for shape in shapes])
+            flat = np.empty(int(ends[-1]), dtype=self._dtype)
+            out = [flat[ends[i]:ends[i + 1]].reshape((1,) + shape) for i, shape in enumerate(shapes)]
         # The batched routine with a batch of one: a single GEMM, whatever
         # the number and position of the fixed axes
-        tables, status = self._precontract_tables(np, axes, row)
+        tables, status = self._precontract_tables(np, axes, row, out=None if flat is None else out)
         if status[0]:
             x = np.full(self.ndim, np.nan)
             x[axes] = row[0]
@@ -816,6 +842,7 @@ class ChebyshevInterpolantND:
             discarded_l2=self._discarded_l2,
             truncation=self._truncation,
             dtype=self._dtype,
+            flat=flat,
         )
 
     def precontract_batch(self, fixed, return_status=False):
@@ -881,13 +908,15 @@ class ChebyshevInterpolantND:
             )
         return batch
 
-    def _precontract_tables(self, xp, axes, values, full=False):
+    def _precontract_tables(self, xp, axes, values, full=False, out=None):
         """
         Per-member tables with ``axes`` fixed at the rows of ``values``.
 
         The table with the fixed axes moved to the front is cached per set of
         axes (and device), so repeated precontractions skip the transpose.
         This costs one extra copy of the table per set of axes in use.
+        For a blocked table, ``out`` may give the arrays to write each
+        block's result into.
         """
         key = (xp.__name__, tuple(axes), full)
         if key not in self._fixed_first:
@@ -904,7 +933,7 @@ class ChebyshevInterpolantND:
         if isinstance(table, list):
             # A blocked table: one GEMM per block, the outputs keep their blocks
             tables, status = precontract_blocks(table, a, b, len(axes), values, tol=self._domain_tol,
-                                                status_axes=axes)
+                                                status_axes=axes, out=out)
             box = tuple(k for i, k in enumerate(self._kmax) if i not in axes)
             return BlockedCoeffs(tables, self._table_on(xp)[0].outputs, self._n_out, self._dtype,
                                  box=box, members=values.shape[0], xp=xp), status

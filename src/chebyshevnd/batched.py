@@ -494,7 +494,7 @@ def precontract_tables(coeffs, a, b, fixed_axes, fixed_values, tol=1e-12, status
     return _contract_leading(table, len(fixed_axes), bases, xp), status
 
 
-def precontract_blocks(blocks, a, b, n_fixed, fixed_values, tol=1e-12, status_axes=None):
+def precontract_blocks(blocks, a, b, n_fixed, fixed_values, tol=1e-12, status_axes=None, out=None):
     """
     :func:`precontract_tables` for the blocks of a blocked table.
 
@@ -517,11 +517,14 @@ def precontract_blocks(blocks, a, b, n_fixed, fixed_values, tol=1e-12, status_ax
         Allowed overshoot outside the domain.
     status_axes : sequence of int, optional
         The status bit for each fixed axis; defaults to 0, ..., n_fixed - 1.
+    out : sequence of arrays, optional
+        C-contiguous arrays of shape (B, k_live..., F_b), one per block, to
+        write the tables into.
 
     Returns
     -------
     tables : list of arrays, each (B, k_live..., F_b)
-        One per block.
+        One per block (``out`` if given).
     status : int64 array, shape (B,)
     """
     xp = array_namespace(fixed_values, *blocks)
@@ -534,7 +537,8 @@ def precontract_blocks(blocks, a, b, n_fixed, fixed_values, tol=1e-12, status_ax
         return [], status
     longest = [max(int(c.shape[i]) for c in blocks) for i in range(n_fixed)]
     bases = [chebyshev_basis_batch(ts[:, i], k, xp) for i, k in enumerate(longest)]
-    return [_contract_leading(c, n_fixed, bases, xp) for c in blocks], status
+    targets = out if out is not None else [None] * len(blocks)
+    return [_contract_leading(c, n_fixed, bases, xp, t) for c, t in zip(blocks, targets)], status
 
 
 def _fixed_status(values, a, b, tol, bits, xp):
@@ -545,12 +549,13 @@ def _fixed_status(values, a, b, tol, bits, xp):
     return ts, (outside * weights).sum(axis=1)
 
 
-def _contract_leading(table, n_fixed, bases, xp):
+def _contract_leading(table, n_fixed, bases, xp, out=None):
     """
     Contract the first ``n_fixed`` axes of a C-contiguous table with each
     member's bases (``bases[i]`` of shape (B, >= k_i)), in one GEMM.
 
-    Returns the per-member tables, shape (B, k_live..., F).
+    Returns the per-member tables, shape (B, k_live..., F), written into
+    ``out`` (a C-contiguous array of that shape) if given.
     """
     is_complex = table.dtype.kind == "c"
     k_fixed = table.shape[:n_fixed]
@@ -565,6 +570,10 @@ def _contract_leading(table, n_fixed, bases, xp):
         weights_matrix = (weights_matrix[:, :, None] * bases[i][:, None, :k_fixed[i]]).reshape(
             weights_matrix.shape[0], -1)
 
+    if out is not None:
+        target = out.view(xp.float64) if is_complex else out
+        xp.matmul(weights_matrix, flat, out=target.reshape(weights_matrix.shape[0], -1))
+        return out
     tables = xp.ascontiguousarray(weights_matrix @ flat)
     if is_complex:
         tables = tables.view(xp.complex128)

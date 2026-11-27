@@ -102,7 +102,7 @@ def table_namespace(table):
     return table.xp if isinstance(table, BlockedCoeffs) else array_namespace(table)
 
 
-def pack_blocks(blocks, d, dtype):
+def pack_blocks(blocks, d, dtype, flat=None):
     """
     The blocks as flat arrays for the Numba kernels.
 
@@ -114,6 +114,9 @@ def pack_blocks(blocks, d, dtype):
         Number of axes.
     dtype : dtype
         Coefficient dtype.
+    flat : 1D array, optional
+        A buffer that already holds the blocks one after the other (e.g.
+        written there by a precontraction), used instead of a copy.
 
     Returns
     -------
@@ -130,7 +133,10 @@ def pack_blocks(blocks, d, dtype):
         Block b's outputs are ``out_index[out_offsets[b]:out_offsets[b + 1]]``.
     """
     n = len(blocks)
-    if n == 1 and blocks[0][0].flags.c_contiguous:
+    if flat is not None:
+        if flat.size != sum(c.size for c, _ in blocks):
+            raise ValueError("flat does not hold exactly the blocks.")
+    elif n == 1 and blocks[0][0].flags.c_contiguous:
         flat = blocks[0][0].reshape(-1)
     elif n:
         flat = np.concatenate([np.ascontiguousarray(c).reshape(-1) for c, _ in blocks])
