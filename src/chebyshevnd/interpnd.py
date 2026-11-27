@@ -155,6 +155,7 @@ class ChebyshevInterpolantND:
 
         abs_c = np.abs(self._coeffs_full)
         self._scale_value = abs_c.reshape(-1, n_out).max(axis=0)
+        self._scale_fallback = None
         self._interp_error = _trailing_error_estimate(abs_c)
         self._discarded = np.zeros(n_out)
         self._discarded_l2 = np.zeros(n_out)
@@ -167,7 +168,7 @@ class ChebyshevInterpolantND:
     @classmethod
     def _from_tables(cls, coeffs, coeffs_full, a, b, *, nodes, axis_names, output_names,
                      domain_tol, abs_error, grid_shape, discarded=None, scale=None,
-                     discarded_l2=None, truncation=None, dtype=None, flat=None):
+                     discarded_l2=None, truncation=None, dtype=None, flat=None, scale_fallback=None):
         """
         Build an interpolant directly from coefficient tensors, e.g. the result
         of a precontraction, or a table read from a file.
@@ -185,6 +186,9 @@ class ChebyshevInterpolantND:
         restore a saved table exactly. ``dtype`` is needed only for a blocked
         table with no blocks. ``flat``, for a blocked table, is a buffer that
         already holds its blocks one after the other (see ``pack_blocks``).
+        ``scale_fallback`` is the scale of outputs stored in no block, when
+        there is no full tensor to take it from (the parent's, for a
+        precontraction).
         """
         self = cls.__new__(cls)
         self._single = len(output_names) == 0
@@ -209,6 +213,7 @@ class ChebyshevInterpolantND:
         # Without a given scale, it is computed on first use (see _scale): a
         # pass over the coefficients that precontraction need not pay for
         self._scale_value = None if scale is None else np.array(scale, dtype=np.float64)
+        self._scale_fallback = scale_fallback
         self._interp_error = np.array(abs_error, dtype=np.float64)
         self._discarded = np.zeros(n_out) if discarded is None else np.array(discarded, dtype=np.float64)
         self._discarded_l2 = (np.zeros(n_out) if discarded_l2 is None
@@ -244,8 +249,20 @@ class ChebyshevInterpolantND:
         self._n_out = int(n_out)
         self._dtype = np.dtype(dtype)
         blocks = [(c, np.asarray(o, dtype=np.int64)) for c, o in blocks]
+        # The kernels trust these shapes and indices, so check them here
+        # (blocks may come from a file)
+        for c, o in blocks:
+            if (c.ndim != d + 1 or o.ndim != 1 or c.shape[-1] != o.shape[0]
+                    or min(c.shape[:-1], default=1) < 1 or c.dtype != self._dtype):
+                raise ValueError(
+                    f"Inconsistent coefficient block: shape {c.shape} and dtype {c.dtype} for "
+                    f"{o.shape[0]} outputs of a {d}-dimensional {self._dtype} table.")
         self._dense = (len(blocks) == 1 and blocks[0][1].shape[0] == self._n_out
                        and bool(np.all(blocks[0][1] == np.arange(self._n_out))))
+        if not self._dense and blocks:
+            index = np.concatenate([o for _, o in blocks])
+            if index.min() < 0 or index.max() >= self._n_out or np.unique(index).size != index.size:
+                raise ValueError(f"The blocks' output indices must be distinct and in [0, {self._n_out}).")
         if self._dense:
             self._coeffs = np.ascontiguousarray(blocks[0][0])
             self._blocks = ((self._coeffs, blocks[0][1]),)
@@ -281,16 +298,18 @@ class ChebyshevInterpolantND:
     def _scale(self):
         """
         The largest coefficient magnitude per output, from the full tensor
-        if it is held, otherwise from the stored blocks (zero for outputs in
-        none). Computed on first use. ``optimize`` reads it before it
-        replaces the blocks or drops the full tensor, so the value never
-        depends on when it is first needed.
+        if it is held, otherwise from the stored blocks. An output stored in
+        no block takes the scale it inherited (``scale_fallback``), or zero.
+        Computed on first use. ``optimize`` reads it before it replaces the
+        blocks or drops the full tensor, so the value never depends on when
+        it is first needed.
         """
         if self._scale_value is None:
             if self._coeffs_full is not None:
                 scale = np.abs(self._coeffs_full).reshape(-1, self._n_out).max(axis=0)
             else:
-                scale = np.zeros(self._n_out)
+                scale = (np.zeros(self._n_out) if self._scale_fallback is None
+                         else np.array(self._scale_fallback, dtype=np.float64))
                 for c, o in self._blocks:
                     scale[o] = np.abs(c).reshape(-1, len(o)).max(axis=0)
             self._scale_value = scale
@@ -371,7 +390,8 @@ class ChebyshevInterpolantND:
         sum of magnitudes in :meth:`absolute_error`, it is not a bound on
         the error, but when the removed coefficients are noise it is a far
         better estimate of its typical size. Zero for a table that was
-        never optimized. A precontraction inherits its parent's figure (its
+        never optimized, and for one loaded from a file written before this
+        figure was recorded. A precontraction inherits its parent's figure (its
         error at a point is the parent's error there); a derivative gets the
         figure of its own discarded coefficients if the full tensor is held,
         and otherwise its parent's, scaled like the truncation bound.
@@ -831,18 +851,27 @@ class ChebyshevInterpolantND:
             full = self._precontract_tables(np, axes, row, full=True)[0][0]
 
         live = [i for i in range(self.ndim) if i not in axes]
+        if self._coeffs_full is None:
+            # Keep the truncation bound apart: without the full tensor, a
+            # derivative of the result can only scale it, not recompute it
+            abs_error, discarded = self._interp_error, self._discarded
+        else:
+            abs_error, discarded = self._interp_error + self._discarded, None
         return ChebyshevInterpolantND._from_tables(
             coeffs, full, self._a[live], self._b[live],
             nodes=self._nodes,
             axis_names=[self._axis_names[i] for i in live],
             output_names=self._output_names,
             domain_tol=self._domain_tol,
-            abs_error=self._interp_error + self._discarded,
+            abs_error=abs_error,
+            discarded=discarded,
             grid_shape=[self._grid_shape[i] for i in live],
             discarded_l2=self._discarded_l2,
             truncation=self._truncation,
             dtype=self._dtype,
             flat=flat,
+            # Outputs stored in no block keep their parent's scale
+            scale_fallback=self._scale if (full is None and not self._dense) else None,
         )
 
     def precontract_batch(self, fixed, return_status=False):
@@ -1048,6 +1077,7 @@ class ChebyshevInterpolantND:
             factor = self._markov_factor(orders)
             truncation = self._discarded * factor
             discarded_l2 = self._discarded_l2 * factor
+            fallback = None if self._dense else self._scale * factor
 
         # Rounding noise in the coefficients, amplified by the same Markov
         # factor; it dominates once a function is resolved to rounding level
@@ -1057,17 +1087,24 @@ class ChebyshevInterpolantND:
             amplification *= (max(n - 1, 1) ** 2 * 2.0 / (b - a)) ** o
         rounding = np.finfo(np.float64).eps * self._scale * amplification if any(orders) else 0.0
 
+        if full is None:
+            # Keep the truncation bound apart, so a further derivative scales it
+            abs_error, discarded = interp_error + rounding, truncation
+        else:
+            abs_error, discarded, fallback = interp_error + truncation + rounding, None, None
         return ChebyshevInterpolantND._from_tables(
             kept[0][0] if self._dense else kept, full, self._a, self._b,
             nodes=self._nodes,
             axis_names=self._axis_names,
             output_names=self._output_names,
             domain_tol=self._domain_tol,
-            abs_error=interp_error + truncation + rounding,
+            abs_error=abs_error,
+            discarded=discarded,
             grid_shape=self._grid_shape,
             discarded_l2=discarded_l2,
             truncation=self._truncation,
             dtype=self._dtype,
+            scale_fallback=fallback,
         )
 
     def check_derivatives(self, orders, points, step=None):

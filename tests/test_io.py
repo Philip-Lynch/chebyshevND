@@ -415,6 +415,24 @@ def test_blocked_mapped_round_trip(tmp_path):
     np.testing.assert_array_equal(child.evaluate(x[0, 1], x[0, 3]), want.evaluate(x[0, 1], x[0, 3]))
 
 
+@pytest.mark.parametrize("bad", ["out of range", "negative", "repeated", "shape"])
+def test_load_refuses_inconsistent_blocks(tmp_path, bad):
+    # The Numba kernels trust the block layout, so a damaged file must not load
+    table, _ = blocked_table(3, max_blocks=3)
+    save(tmp_path / "b.h5", table)
+    with h5py.File(tmp_path / "b.h5", "a") as f:
+        outputs = f["blocks/0/outputs"]
+        other = int(f["blocks/1/outputs"][0])
+        if bad == "shape":
+            data = outputs[()]
+            del f["blocks/0/outputs"]
+            f["blocks/0/outputs"] = data[:-1] if len(data) > 1 else np.array([0, 1])
+        else:
+            outputs[0] = {"out of range": table.n_outputs, "negative": -1, "repeated": other}[bad]
+    with pytest.raises(ValueError):
+        load(tmp_path / "b.h5")
+
+
 def test_empty_blocked_table_round_trip(tmp_path):
     table = ChebyshevInterpolantND(np.zeros((5, 4, 3)), [(0, 1), (0, 1)], output_names=["a", "b", "c"])
     table.optimize(1e-8, per_output=True)
@@ -453,7 +471,8 @@ def test_default_optimize_matches_the_version_1_fixture():
         np.testing.assert_array_equal(plain.absolute_error(), ref["plain/abs_error"])
     else:
         np.testing.assert_allclose(plain.get_coefficients(), ref["plain/coeffs"], rtol=1e-12, atol=1e-16)
-        np.testing.assert_allclose(plain.absolute_error(), ref["plain/abs_error"], rtol=1e-6)
+        # An exact polynomial's estimate is rounding noise, so compare absolutely there
+        np.testing.assert_allclose(plain.absolute_error(), ref["plain/abs_error"], rtol=1e-6, atol=1e-15)
 
 
 # ------------------------------------------------------------------- GPU

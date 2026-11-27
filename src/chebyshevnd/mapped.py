@@ -82,17 +82,29 @@ class MappedInterpolant:
         self._buffers = None
         self._device = {}
         self._cached_for = table._blocks
+        self._cached_boundary = None if boundary is None else boundary._blocks
+
+    def _stale(self):
+        """True if the table or the boundary table was optimized since the caches were made."""
+        return self._cached_for is not self._table._blocks or (
+            self._boundary is not None and self._cached_boundary is not self._boundary._blocks)
 
     def _fresh(self):
         """
-        Drop the cached arrays if the table was optimized since they were made
-        (``optimize`` replaces its blocks), so they never go stale.
+        Drop the cached arrays if the table or the boundary table was
+        optimized since they were made (``optimize`` replaces its blocks), so
+        they never go stale.
         """
-        if self._cached_for is not self._table._blocks:
+        if self._stale():
+            if self._boundary is not None and not self._boundary._dense:
+                raise NotImplementedError(
+                    "The boundary table was optimized with per_output=True after wrapping; boundary "
+                    "tables must stay dense. Optimize it with per_output=False.")
             self._raw = None
             self._buffers = None
             self._device = {}
             self._cached_for = self._table._blocks
+            self._cached_boundary = None if self._boundary is None else self._boundary._blocks
 
     # ------------------------------------------------------------- properties
 
@@ -625,7 +637,8 @@ class MappedInterpolant:
         values + gradients, and the kernels for the two (dense or blocked).
         Built once, so a call only fills ``self._x``.
         """
-        if self._cached_for is not self._table._blocks:
+        if self._cached_for is not self._table._blocks or (
+                self._boundary is not None and self._cached_boundary is not self._boundary._blocks):
             self._fresh()
         if self._buffers is None:
             raw = self.raw()

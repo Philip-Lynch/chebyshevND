@@ -175,6 +175,22 @@ def test_markov_bound_covers_the_degree_of_the_discarded_coefficients(order):
     assert actual <= nd.derivative([order]).absolute_error()
 
 
+def test_truncation_bound_survives_precontraction_and_repeated_derivatives():
+    # Without the full tensor, precontract() and derivative() must keep the
+    # truncation bound apart, so that a later derivative can scale it
+    x = chebyshev_nodes(10, -1.0, 1.0)
+    t9 = np.cos(9 * np.arccos(x))
+    nd = ChebyshevInterpolantND(1.0 + 1e-6 * np.outer(t9, t9), [(-1.0, 1.0)] * 2)
+    nd.optimize(1e-5, keep_full=False)
+    assert nd.kmax == (1, 1)
+    child = nd.precontract({1: 1.0})  # 1 + 1e-6 T_9(x)
+    assert 1e-6 * 81 <= child.derivative([1]).absolute_error()
+    once = ChebyshevInterpolantND(1.0 + 1e-6 * t9, [(-1.0, 1.0)])
+    once.optimize(1e-5, keep_full=False)
+    # T_9'' (1) = 81 * 80 / 3
+    assert 1e-6 * 81 * 80 / 3 <= once.derivative([1]).derivative([1]).absolute_error()
+
+
 def test_order_beyond_degree_gives_zero():
     _, vals = sample_on_grid(lambda x, y: x**2 + y, [(0, 1), (0, 1)], (3, 4))
     nd = ChebyshevInterpolantND(vals, [(0, 1), (0, 1)])

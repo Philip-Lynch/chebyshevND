@@ -190,7 +190,7 @@ def test_blocked_precontraction_matches_dense(d, dtype):
         assert_close(got_b.evaluate(pts[:, live]), want_b.evaluate(pts[:, live]), scale)
         for g, w in zip(got_b.value_and_grad(pts[:, live]), want_b.value_and_grad(pts[:, live])):
             assert_close(g, w, 1e2 * scale)
-        np.testing.assert_array_equal(got_b.tables, np.asarray(want_b.tables))
+        assert_close(got_b.tables, want_b.tables, scale)  # GEMMs of different sizes: rounding
 
 
 def test_precontraction_with_the_full_tensor_can_be_optimized_again():
@@ -272,6 +272,17 @@ def test_a_table_of_zeros_stores_nothing():
     out = np.ones(2)
     assert eval_blocked_into(*raw, np.array([0.3, 0.4]), *raw.workspace(), out) == 0
     assert np.all(out == 0)
+
+
+def test_relative_error_of_empty_outputs_after_precontraction():
+    # Outputs stored in no block keep their parent's scale, so their
+    # relative error is not reported as zero
+    table, _ = blocked_table(3, keep_full=False)
+    empty = table.output_kmax[:, 0] == 0
+    child = table.precontract({"x": 0.3})
+    np.testing.assert_array_equal(child.absolute_error()[empty], table.absolute_error()[empty])
+    np.testing.assert_allclose(child.relative_error()[empty], table.relative_error()[empty], rtol=1e-15)
+    assert np.all(child.relative_error()[empty] > 0)
 
 
 @pytest.mark.parametrize("norm", ["l1", "l2"])
@@ -682,7 +693,23 @@ def test_mapped_caches_follow_the_table(boundary):
     after = m.evaluate(*p)
     assert after[3] == 0 and before[3] != 0
     np.testing.assert_allclose(after[:3], before[:3], rtol=0, atol=1e-8)
-    np.testing.assert_array_equal(m.evaluate_batch(p[None])[0], after)
+    # The batched path (BLAS) agrees to rounding, which differs between BLAS libraries
+    np.testing.assert_allclose(m.evaluate_batch(p[None])[0], after, rtol=1e-14, atol=1e-16)
+
+
+def test_mapped_caches_follow_the_boundary():
+    names = ["r", "p", "e", "q"]
+    own = make_boundary()
+    m = fit_mapped(names, SHAPE, DOMAINS, MAPS, own, [F], output_names=["F"])
+    p = random_physical(1, seed=8, margin=0.01)[0]
+    m.evaluate(*p)
+    # Optimizing the boundary in place after wrapping: both paths see it
+    own.optimize(1e-4)
+    np.testing.assert_allclose(m.evaluate(*p), m.evaluate_batch(p[None])[0], rtol=1e-13, atol=1e-15)
+    # A boundary may not become blocked
+    own.optimize(1e-4, per_output=True)
+    with pytest.raises(NotImplementedError, match="boundary"):
+        m.evaluate(*p)
 
 
 def test_blocked_boundary_tables_are_refused(boundary):

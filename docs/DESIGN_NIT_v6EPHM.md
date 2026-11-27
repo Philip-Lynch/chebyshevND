@@ -1245,8 +1245,19 @@ and blocked storage, with every default unchanged.
     the coefficient scale, which only error estimates use. It is now
     computed on first use, which takes the dense `fourier0` precontraction
     from 1.35 to 0.93 ms.
-  - `MappedInterpolant`'s cached arrays went stale if `m.table` was
-    optimized after wrapping. They now follow the table.
+  - `MappedInterpolant`'s cached arrays went stale if `m.table` (or the
+    boundary table) was optimized after wrapping. They now follow both, and a
+    boundary that became blocked is refused.
+  - From an independent review of the branch:
+    - Without the full tensor, `precontract` and `derivative` folded the
+      truncation bound into the interpolation estimate, so a later
+      derivative lost it (2.2e-16 reported against 8.1e-5). They now keep
+      it apart, so it is scaled again. This bug was on `dev` too.
+    - `load` checks the block layout (output indices distinct and in
+      range, shapes consistent). The kernels trust it, and a damaged file
+      could otherwise write out of bounds.
+    - Outputs stored in no block keep their parent's scale through a
+      precontraction, so their relative error is not reported as zero.
 - **Boundary tables must stay dense** (`NotImplementedError` otherwise).
   They are tiny, and the mapped kernels take one dense boundary.
 - **File format version 2** (`docs/file_format.md`): `blocks/<b>/coeffs` and
