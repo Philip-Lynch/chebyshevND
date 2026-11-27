@@ -24,6 +24,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from .backend import array_namespace
+from .blocks import BlockedCoeffs
 
 #: Memory allowed for the intermediate array of one chunk when evaluating a
 #: shared table. Its size is (chunk size) x (table size / k_1) entries.
@@ -131,6 +132,8 @@ def evaluate_batch(coeffs, a, b, points, tol=1e-12, max_chunk_bytes=DEFAULT_MAX_
     --------
     value_and_grad_batch : the values together with their gradients.
     """
+    if isinstance(coeffs, BlockedCoeffs):
+        return _evaluate_blocks(coeffs, a, b, points, tol, max_chunk_bytes, gradient=False)
     batch = _prepare(coeffs, a, b, points, tol)
     xp, ts, k = batch.xp, batch.ts, batch.k
     n_points = ts.shape[0]
@@ -176,6 +179,8 @@ def value_and_grad_batch(coeffs, a, b, points, tol=1e-12, max_chunk_bytes=DEFAUL
     status : int64 array, shape (B,)
         As for :func:`evaluate_batch`.
     """
+    if isinstance(coeffs, BlockedCoeffs):
+        return _evaluate_blocks(coeffs, a, b, points, tol, max_chunk_bytes, gradient=True)
     batch = _prepare(coeffs, a, b, points, tol)
     xp, ts, k = batch.xp, batch.ts, batch.k
     n_points, d = ts.shape
@@ -257,10 +262,7 @@ def _prepare(coeffs, a, b, points, tol):
     a = xp.asarray(a, dtype=xp.float64)
     b = xp.asarray(b, dtype=xp.float64)
 
-    ts = (2.0 * points - a - b) / (b - a)
-    outside = ~(xp.abs(ts) <= 1.0 + tol)
-    weights = xp.asarray([1 << i for i in range(d)], dtype=xp.int64)
-    status = (outside * weights).sum(axis=1)
+    ts, status = _map_points(points, a, b, tol, xp)
 
     return _Batch(
         xp=xp, ts=ts, a=a, b=b, status=status, per_member=per_member, is_complex=is_complex,
@@ -269,6 +271,93 @@ def _prepare(coeffs, a, b, points, tol):
         # Interleave real and imaginary parts so every product stays real
         table=coeffs.view(xp.float64) if is_complex else coeffs,
     )
+
+
+def _map_points(points, a, b, tol, xp):
+    """Points mapped to [-1, 1] per axis, and the status bitmask of each point."""
+    d = points.shape[1]
+    ts = (2.0 * points - a - b) / (b - a)
+    outside = ~(xp.abs(ts) <= 1.0 + tol)
+    weights = xp.asarray([1 << i for i in range(d)], dtype=xp.int64)
+    return ts, (outside * weights).sum(axis=1)
+
+
+def _evaluate_blocks(table, a, b, points, tol, max_chunk_bytes, gradient):
+    """
+    :func:`evaluate_batch` (or, with ``gradient``, :func:`value_and_grad_batch`)
+    for a table stored in blocks.
+
+    The points are mapped and their Chebyshev values computed once (per
+    chunk), up to the largest k of any block; each block is then contracted
+    as a table of its own, and its outputs are scattered into a zero array.
+    """
+    xp = table.xp
+    points = xp.asarray(points, dtype=xp.float64)
+    if points.ndim != 2:
+        raise ValueError(f"points must have shape (B, d), got {points.shape}.")
+    n_points, d = points.shape
+    if len(table.box) != d:
+        raise ValueError(f"The table has {len(table.box)} axes but the points have {d} coordinates.")
+    if table.per_member and table.members != n_points:
+        raise ValueError(
+            f"Per-member tables hold {table.members} members but {n_points} points were given."
+        )
+    a = xp.asarray(a, dtype=xp.float64)
+    b = xp.asarray(b, dtype=xp.float64)
+    ts, status = _map_points(points, a, b, tol, xp)
+    is_complex = table.dtype.kind == "c"
+    # Value, and with the gradient one branch per axis, for every output
+    branches = xp.zeros((n_points, d + 1 if gradient else 1, table.n_outputs), dtype=table.dtype)
+
+    reals = [c.view(xp.float64) if is_complex else c for c in table.blocks]
+    lead = 1 if table.per_member else 0
+    ks = [tuple(int(n) for n in c.shape[lead:-1]) for c in table.blocks]
+    if n_points and reals:
+        n_basis = max(max(k) for k in ks)
+        if table.per_member:
+            starts = [0]
+            rows = n_points
+        else:
+            # The intermediate of a shared block holds (2 if gradient) rows of
+            # (block size / k_1) entries per point; size chunks for the largest
+            width = max(r.size // k[0] for r, k in zip(reals, ks)) * (2 if gradient else 1)
+            rows = max(1, max_chunk_bytes // (width * 8))
+            starts = range(0, n_points, rows)
+        for start in starts:
+            chunk = ts[start:start + rows]
+            m = chunk.shape[0]
+            if gradient:
+                T, D = chebyshev_basis_batch(chunk, n_basis, xp, derivative=True)
+            else:
+                T = chebyshev_basis_batch(chunk, n_basis, xp)
+            for real, k, idx in zip(reals, ks, table.outputs):
+                def cut(P, ax, k=k):
+                    return xp.ascontiguousarray(P[:, ax, :k[ax]])
+                if gradient:
+                    bases = [(cut(T, ax), cut(D, ax)) for ax in range(d)]
+                    if table.per_member:
+                        part = _contract_axes_with_gradient(real.reshape(m, 1, -1), bases, 0, xp)
+                    else:
+                        T0, D0 = bases[0]
+                        both = xp.stack([T0, D0], axis=1).reshape(2 * m, k[0])
+                        partial = (both @ real.reshape(k[0], -1)).reshape(m, 2, -1)
+                        part = _contract_axes_with_gradient(partial, bases, 1, xp)
+                else:
+                    bases = [cut(T, ax) for ax in range(d)]
+                    if table.per_member:
+                        part = _contract_axes(real.reshape(m, k[0], -1), bases, 0, xp)[:, None, :]
+                    else:
+                        flat = real.reshape(k[0], -1)
+                        part = _contract_axes(bases[0] @ flat, bases, 1, xp)[:, None, :]
+                part = xp.ascontiguousarray(part)
+                if is_complex:
+                    part = part.view(xp.complex128)
+                branches[start:start + m, :, idx] = part
+
+    if not gradient:
+        return branches[:, 0], status
+    scale = 2.0 / (b - a)
+    return xp.ascontiguousarray(branches[:, 0]), branches[:, 1:] * scale[None, :, None], status
 
 
 def _axis_bases(ts, k, xp, derivative=False):
@@ -391,35 +480,92 @@ def precontract_tables(coeffs, a, b, fixed_axes, fixed_values, tol=1e-12, status
         raise ValueError(f"fixed_axes must be distinct axes in [0, {d}); got {fixed_axes}.")
     is_complex = coeffs.dtype.kind == "c"
     dtype = xp.complex128 if is_complex else xp.float64
-    n_members = values.shape[0]
 
-    a = xp.asarray(a, dtype=xp.float64)[fixed_axes]
-    b = xp.asarray(b, dtype=xp.float64)[fixed_axes]
-    ts = (2.0 * values - a - b) / (b - a)
-    outside = ~(xp.abs(ts) <= 1.0 + tol)
     bits = fixed_axes if status_axes is None else [int(ax) for ax in status_axes]
-    weights = xp.asarray([1 << ax for ax in bits], dtype=xp.int64)
-    status = (outside * weights).sum(axis=1)
+    ts, status = _fixed_status(values, xp.asarray(a, dtype=xp.float64)[fixed_axes],
+                               xp.asarray(b, dtype=xp.float64)[fixed_axes], tol, bits, xp)
 
     live = [ax for ax in range(d) if ax not in fixed_axes]
     k_fixed = [coeffs.shape[ax] for ax in fixed_axes]
-    k_live = [coeffs.shape[ax] for ax in live]
-    n_out = coeffs.shape[-1]
 
     # Fixed axes first, then the live ones, then the output axis
     table = xp.ascontiguousarray(xp.transpose(coeffs, fixed_axes + live + [d]), dtype=dtype)
-    if is_complex:
-        table = table.view(xp.float64)
-    flat = table.reshape(math.prod(k_fixed), -1)
+    bases = [chebyshev_basis_batch(ts[:, i], k, xp) for i, k in enumerate(k_fixed)]
+    return _contract_leading(table, len(fixed_axes), bases, xp), status
+
+
+def precontract_blocks(blocks, a, b, n_fixed, fixed_values, tol=1e-12, status_axes=None):
+    """
+    :func:`precontract_tables` for the blocks of a blocked table.
+
+    Every block is a shared table whose first ``n_fixed`` axes are the ones
+    to fix (already moved to the front). The status and the Chebyshev
+    values of the fixed values are computed once, up to the largest k of
+    any block; each block is then contracted with a single GEMM.
+
+    Parameters
+    ----------
+    blocks : sequence of arrays, each (k_1, ..., k_d, F_b)
+        The blocks, fixed axes first, all on one device.
+    a, b : array-like, shape (d,)
+        Lower and upper bound of each axis, in the blocks' axis order.
+    n_fixed : int
+        Number of leading axes to fix.
+    fixed_values : array, shape (B, n_fixed)
+        The value of each fixed axis for each member.
+    tol : float, optional
+        Allowed overshoot outside the domain.
+    status_axes : sequence of int, optional
+        The status bit for each fixed axis; defaults to 0, ..., n_fixed - 1.
+
+    Returns
+    -------
+    tables : list of arrays, each (B, k_live..., F_b)
+        One per block.
+    status : int64 array, shape (B,)
+    """
+    xp = array_namespace(fixed_values, *blocks)
+    values = xp.asarray(fixed_values, dtype=xp.float64)
+    bits = list(range(n_fixed)) if status_axes is None else [int(ax) for ax in status_axes]
+    a = xp.asarray(a, dtype=xp.float64)[:n_fixed]
+    b = xp.asarray(b, dtype=xp.float64)[:n_fixed]
+    ts, status = _fixed_status(values, a, b, tol, bits, xp)
+    if not blocks:
+        return [], status
+    longest = [max(int(c.shape[i]) for c in blocks) for i in range(n_fixed)]
+    bases = [chebyshev_basis_batch(ts[:, i], k, xp) for i, k in enumerate(longest)]
+    return [_contract_leading(c, n_fixed, bases, xp) for c in blocks], status
+
+
+def _fixed_status(values, a, b, tol, bits, xp):
+    """Fixed values mapped to [-1, 1], and each member's status bits (``bits[i]`` for column i)."""
+    ts = (2.0 * values - a - b) / (b - a)
+    outside = ~(xp.abs(ts) <= 1.0 + tol)
+    weights = xp.asarray([1 << ax for ax in bits], dtype=xp.int64)
+    return ts, (outside * weights).sum(axis=1)
+
+
+def _contract_leading(table, n_fixed, bases, xp):
+    """
+    Contract the first ``n_fixed`` axes of a C-contiguous table with each
+    member's bases (``bases[i]`` of shape (B, >= k_i)), in one GEMM.
+
+    Returns the per-member tables, shape (B, k_live..., F).
+    """
+    is_complex = table.dtype.kind == "c"
+    k_fixed = table.shape[:n_fixed]
+    shape_live = table.shape[n_fixed:]
+    real = table.view(xp.float64) if is_complex else table
+    flat = real.reshape(math.prod(k_fixed), -1)
 
     # Row j of W is the outer product of member j's bases on the fixed axes,
     # flattened in the same (C) order as the fixed axes of `flat`
-    weights_matrix = chebyshev_basis_batch(ts[:, 0], k_fixed[0], xp)
-    for i in range(1, len(fixed_axes)):
-        basis = chebyshev_basis_batch(ts[:, i], k_fixed[i], xp)
-        weights_matrix = (weights_matrix[:, :, None] * basis[:, None, :]).reshape(n_members, -1)
+    weights_matrix = bases[0][:, :k_fixed[0]]
+    for i in range(1, n_fixed):
+        weights_matrix = (weights_matrix[:, :, None] * bases[i][:, None, :k_fixed[i]]).reshape(
+            weights_matrix.shape[0], -1)
 
     tables = xp.ascontiguousarray(weights_matrix @ flat)
     if is_complex:
         tables = tables.view(xp.complex128)
-    return tables.reshape((n_members,) + tuple(k_live) + (n_out,)), status
+    return tables.reshape((tables.shape[0],) + tuple(shape_live))

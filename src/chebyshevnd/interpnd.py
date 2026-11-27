@@ -6,12 +6,28 @@ import numpy as np
 
 from .backend import array_namespace, resolve_device, to_numpy
 from .batch import ChebyshevBatch
-from .batched import precontract_tables
+from .batched import precontract_blocks, precontract_tables
 from .batched import evaluate_batch as _evaluate_batch
 from .batched import value_and_grad_batch as _value_and_grad_batch
+from .blocks import (
+    BlockedCoeffs,
+    group_scale,
+    outside_box_sum,
+    pack_blocks,
+    parse_groups,
+    partition_outputs,
+)
 from .derivatives import differentiate_coefficients
 from .errors import OutOfDomainError, describe_out_of_domain
-from .kernels import RawTable, evaluate_point, value_and_grad_point
+from .kernels import (
+    RawBlockedTable,
+    RawTable,
+    blocked_sizes,
+    evaluate_blocks_point,
+    evaluate_point,
+    value_and_grad_blocks_point,
+    value_and_grad_point,
+)
 from .utils import (
     chebyshev_gauss_lobatto_nodes,
     chebyshev_nodes,
@@ -141,6 +157,8 @@ class ChebyshevInterpolantND:
         self._scale = abs_c.reshape(-1, n_out).max(axis=0)
         self._interp_error = _trailing_error_estimate(abs_c)
         self._discarded = np.zeros(n_out)
+        self._discarded_l2 = np.zeros(n_out)
+        self._truncation = None
         self._x = np.empty(d)
         self._set_truncation(self._grid_shape)
 
@@ -148,18 +166,24 @@ class ChebyshevInterpolantND:
 
     @classmethod
     def _from_tables(cls, coeffs, coeffs_full, a, b, *, nodes, axis_names, output_names,
-                     domain_tol, abs_error, grid_shape, discarded=None, scale=None):
+                     domain_tol, abs_error, grid_shape, discarded=None, scale=None,
+                     discarded_l2=None, truncation=None, dtype=None):
         """
         Build an interpolant directly from coefficient tensors, e.g. the result
         of a precontraction, or a table read from a file.
 
         ``coeffs`` (the evaluation tensor) and ``coeffs_full`` (or None) carry
-        a trailing output axis. ``output_names`` is empty for a single
+        a trailing output axis; for a table stored in blocks, ``coeffs`` is
+        instead a sequence of ``(block, outputs)`` pairs (see
+        :mod:`chebyshevnd.blocks`). ``output_names`` is empty for a single
         function. ``abs_error`` (one value per output) becomes the error
         estimate: it is inherited from the parent, whose bound still holds.
-        ``discarded`` (the truncation part of the estimate, default zero) and
+        ``discarded`` (the truncation part of the estimate, default zero),
         ``scale`` (the largest coefficient magnitude per output, default
-        computed from the coefficients) restore a saved table exactly.
+        computed from the coefficients), ``discarded_l2`` (default zero) and
+        ``truncation`` (the settings of the ``optimize`` that made the table)
+        restore a saved table exactly. ``dtype`` is needed only for a blocked
+        table with no blocks.
         """
         self = cls.__new__(cls)
         self._single = len(output_names) == 0
@@ -172,14 +196,30 @@ class ChebyshevInterpolantND:
         self._output_names = tuple(output_names)
         self._output_index = {name: i for i, name in enumerate(self._output_names)}
         self._coeffs_full = None if coeffs_full is None else np.ascontiguousarray(coeffs_full)
-        reference = coeffs if coeffs_full is None else coeffs_full
-        n_out = reference.shape[-1]
-        self._scale = (np.abs(reference).reshape(-1, n_out).max(axis=0) if scale is None
-                       else np.array(scale, dtype=np.float64))
+        n_out = max(len(self._output_names), 1)
+        if isinstance(coeffs, np.ndarray):
+            blocks = [(coeffs, np.arange(n_out, dtype=np.int64))]
+        else:
+            blocks = [(np.asarray(c), np.asarray(o, dtype=np.int64)) for c, o in coeffs]
+        if blocks:
+            dtype = blocks[0][0].dtype
+        elif self._coeffs_full is not None:
+            dtype = self._coeffs_full.dtype
+        if scale is not None:
+            self._scale = np.array(scale, dtype=np.float64)
+        elif self._coeffs_full is not None:
+            self._scale = np.abs(self._coeffs_full).reshape(-1, n_out).max(axis=0)
+        else:
+            self._scale = np.zeros(n_out)
+            for c, o in blocks:
+                self._scale[o] = np.abs(c).reshape(-1, len(o)).max(axis=0)
         self._interp_error = np.array(abs_error, dtype=np.float64)
         self._discarded = np.zeros(n_out) if discarded is None else np.array(discarded, dtype=np.float64)
+        self._discarded_l2 = (np.zeros(n_out) if discarded_l2 is None
+                              else np.array(discarded_l2, dtype=np.float64))
+        self._truncation = truncation
         self._x = np.empty(self._a.shape[0])
-        self._set_compact(coeffs)
+        self._set_blocks(blocks, n_out, dtype)
         return self
 
     def _set_truncation(self, kmax):
@@ -188,21 +228,61 @@ class ChebyshevInterpolantND:
 
     def _set_compact(self, coeffs):
         """Make ``coeffs`` (trailing output axis included) the evaluation tensor."""
-        self._coeffs = np.ascontiguousarray(coeffs)
-        self._kmax = tuple(int(k) for k in self._coeffs.shape[:-1])
-        self._flat = self._coeffs.reshape(-1)
-        self._shape = np.array(self._kmax, dtype=np.int64)
-        rest = self._flat.shape[0] // self._kmax[0]
-        dtype = self._coeffs.dtype
-        self._scratch = np.empty(len(self._kmax) + max(self._kmax))
-        self._work = np.empty((2, rest), dtype=dtype)
-        self._out = np.empty(self._coeffs.shape[-1], dtype=dtype)
+        n_out = coeffs.shape[-1]
+        self._set_blocks([(coeffs, np.arange(n_out, dtype=np.int64))], n_out, coeffs.dtype)
+
+    def _set_blocks(self, blocks, n_out, dtype):
+        """
+        Make ``blocks`` the evaluation tables: ``(coeffs, outputs)`` pairs,
+        each ``coeffs`` of shape (k_1, ..., k_d, F_b) with the output index
+        of each of its columns in ``outputs``.
+
+        One block holding every output in order is a *dense* table, stored
+        and evaluated as before blocks existed (A2). Anything else is a
+        *blocked* table: every block becomes a view into one flat array, the
+        layout of the blocked kernels, and outputs in no block are zero.
+        """
+        d = len(self._grid_shape)
+        self._n_out = int(n_out)
+        self._dtype = np.dtype(dtype)
+        blocks = [(c, np.asarray(o, dtype=np.int64)) for c, o in blocks]
+        self._dense = (len(blocks) == 1 and blocks[0][1].shape[0] == self._n_out
+                       and bool(np.all(blocks[0][1] == np.arange(self._n_out))))
+        if self._dense:
+            self._coeffs = np.ascontiguousarray(blocks[0][0])
+            self._blocks = ((self._coeffs, blocks[0][1]),)
+            self._packed = None
+            self._kmax = tuple(int(k) for k in self._coeffs.shape[:-1])
+            self._flat = self._coeffs.reshape(-1)
+            self._shape = np.array(self._kmax, dtype=np.int64)
+            rest = self._flat.shape[0] // self._kmax[0]
+            self._scratch = np.empty(len(self._kmax) + max(self._kmax))
+            self._work = np.empty((2, rest), dtype=self._dtype)
+        else:
+            packed = pack_blocks(blocks, d, self._dtype)
+            flat, offsets = packed[0], packed[1]
+            self._blocks = tuple((flat[offsets[i]:offsets[i + 1]].reshape(c.shape), o)
+                                 for i, (c, o) in enumerate(blocks))
+            self._packed = packed
+            self._coeffs = self._flat = self._shape = None
+            self._kmax = tuple(max((int(c.shape[i]) for c, _ in blocks), default=0) for i in range(d))
+            m, rest = blocked_sizes(packed[2], packed[4])
+            # One workspace for both kernels: the gradient kernel needs
+            # d + 2 max(k) scratch and 3 (d + 1) work rows
+            self._scratch = np.empty(d + 2 * m)
+            self._work = np.empty((3 * (d + 1), rest), dtype=self._dtype)
+        self._out = np.empty(self._n_out, dtype=self._dtype)
         # Copies of the table on other devices, and copies with a set of
         # fixed axes moved to the front (for precontraction), made on first use
         self._device_tables = {}
         self._fixed_first = {}
         # Buffers for value_and_grad, allocated on first use
         self._grad_buffers = None
+
+    @property
+    def _untruncated(self):
+        """True if the evaluation tensor is the whole full tensor (never truncated)."""
+        return self._dense and self._kmax == self._grid_shape
 
     # ------------------------------------------------------------- properties
 
@@ -218,8 +298,73 @@ class ChebyshevInterpolantND:
 
     @property
     def kmax(self):
-        """Number of coefficients used per axis after truncation, (k_1, ..., k_d)."""
+        """
+        Number of coefficients used per axis after truncation, (k_1, ..., k_d).
+
+        For a table stored in blocks (after ``optimize(per_output=True)``),
+        the largest over the blocks: the shape of :meth:`get_coefficients`.
+        :attr:`output_kmax` gives each output's own.
+        """
         return self._kmax
+
+    @property
+    def output_kmax(self):
+        """
+        Number of coefficients stored per axis for each function.
+
+        Returns
+        -------
+        np.ndarray
+            int64, shape (F, d): row j is the box of the block that holds
+            function j, and a row of zeros for a function stored in no block
+            (one that evaluates to exactly zero). For a dense table, every
+            row is :attr:`kmax`.
+        """
+        out = np.zeros((self._n_out, self.ndim), dtype=np.int64)
+        for c, o in self._blocks:
+            out[o] = c.shape[:-1]
+        return out
+
+    @property
+    def blocks(self):
+        """
+        The stored coefficients, as ``(outputs, coeffs)`` pairs, one per block.
+
+        A dense table is one block holding every function. After
+        ``optimize(per_output=True)``, block b holds the functions
+        ``outputs`` (int64 positions in evaluation results, ascending) in a
+        dense tensor ``coeffs`` of shape (k_1, ..., k_d, F_b), trailing
+        function axis included even for a single function. Functions in no
+        block evaluate to exactly zero, as do their derivatives.
+
+        Returns
+        -------
+        tuple of (np.ndarray, np.ndarray)
+            Read-only views.
+        """
+        return tuple((_read_only(o), _read_only(c)) for c, o in self._blocks)
+
+    @property
+    def discarded_l2(self):
+        """
+        The root-sum-square of the coefficients removed by :meth:`optimize`.
+
+        ``sqrt(sum of |discarded coefficient|^2)``, per function: the
+        quantity ``optimize(norm="l2")`` keeps below its budget. Unlike the
+        sum of magnitudes in :meth:`absolute_error`, it is not a bound on
+        the error, but when the removed coefficients are noise it is a far
+        better estimate of its typical size. Zero for a table that was
+        never optimized. A precontraction inherits its parent's figure (its
+        error at a point is the parent's error there); a derivative gets the
+        figure of its own discarded coefficients if the full tensor is held,
+        and otherwise its parent's, scaled like the truncation bound.
+
+        Returns
+        -------
+        float or np.ndarray
+            An array of shape (F,) when there is a function axis.
+        """
+        return float(self._discarded_l2[0]) if self._single else self._discarded_l2.copy()
 
     @property
     def domains(self):
@@ -234,7 +379,7 @@ class ChebyshevInterpolantND:
     @property
     def n_outputs(self):
         """Number of functions F held by the interpolant (1 without a function axis)."""
-        return self._coeffs.shape[-1]
+        return self._n_out
 
     @property
     def output_names(self):
@@ -249,7 +394,7 @@ class ChebyshevInterpolantND:
     @property
     def dtype(self):
         """Coefficient dtype: float64, or complex128 for complex values."""
-        return self._coeffs.dtype
+        return self._dtype
 
     @property
     def domain_tol(self):
@@ -285,8 +430,12 @@ class ChebyshevInterpolantND:
             or is NaN.
         """
         x = self._point(xs)
-        status = evaluate_point(self._flat, self._shape, self._bounds, x, self._domain_tol,
-                                self._scratch, self._work, self._out)
+        if self._dense:
+            status = evaluate_point(self._flat, self._shape, self._bounds, x, self._domain_tol,
+                                    self._scratch, self._work, self._out)
+        else:
+            status = evaluate_blocks_point(*self._packed, self._bounds, x, self._domain_tol,
+                                           self._scratch, self._work, self._out)
         if status:
             raise OutOfDomainError(
                 "Point outside the interpolation domain: " + self._domain_message(x, status) + "."
@@ -373,14 +522,23 @@ class ChebyshevInterpolantND:
         x = self._point(xs, "value_and_grad")
         if self._grad_buffers is None:
             d = self.ndim
-            self._grad_buffers = (
-                np.empty(d + 2 * max(self._kmax)),
-                np.empty((2 * (d + 1), self._work.shape[1]), dtype=self.dtype),
-                np.empty((d + 1, self.n_outputs), dtype=self.dtype),
-            )
+            if self._dense:
+                self._grad_buffers = (
+                    np.empty(d + 2 * max(self._kmax)),
+                    np.empty((2 * (d + 1), self._work.shape[1]), dtype=self.dtype),
+                    np.empty((d + 1, self.n_outputs), dtype=self.dtype),
+                )
+            else:
+                # The blocked workspace already serves both kernels
+                self._grad_buffers = (self._scratch, self._work,
+                                      np.empty((d + 1, self.n_outputs), dtype=self.dtype))
         scratch, work, out = self._grad_buffers
-        status = value_and_grad_point(self._flat, self._shape, self._bounds, x, self._domain_tol,
-                                      scratch, work, out)
+        if self._dense:
+            status = value_and_grad_point(self._flat, self._shape, self._bounds, x, self._domain_tol,
+                                          scratch, work, out)
+        else:
+            status = value_and_grad_blocks_point(*self._packed, self._bounds, x, self._domain_tol,
+                                                 scratch, work, out)
         if status:
             raise OutOfDomainError(
                 "Point outside the interpolation domain: " + self._domain_message(x, status) + "."
@@ -428,7 +586,7 @@ class ChebyshevInterpolantND:
         self._check_batch_status(xp, pts, status)
         return values, grads
 
-    def raw(self):
+    def raw(self, blocked=None):
         """
         The table as plain arrays, for evaluation inside the user's own Numba code.
 
@@ -455,20 +613,44 @@ class ChebyshevInterpolantND:
         handles array arguments in compiled code, but tuples in Python,
         which costs about 1.5 us more per call from Python.
 
+        A table stored in blocks (after ``optimize(per_output=True)``)
+        gives a :class:`~chebyshevnd.RawBlockedTable` instead, for
+        :func:`chebyshevnd.eval_blocked_into` and
+        :func:`chebyshevnd.eval_grad_blocked_into`.
+
+        Parameters
+        ----------
+        blocked : bool, optional
+            None (default): a ``RawTable`` for a dense table and a
+            ``RawBlockedTable`` for a blocked one. True: a
+            ``RawBlockedTable`` for either (one block for a dense table), so
+            that one ``@njit`` function written for the blocked entry points
+            serves every table. False: a ``RawTable``, for dense tables only.
+
         Returns
         -------
-        RawTable
+        RawTable or RawBlockedTable
             The compact (truncated) coefficients, the number of coefficients
             per axis, the domain bounds and ``domain_tol``, as read-only
             views. Later calls to :meth:`optimize` do not change it.
-        """
-        def read_only(array):
-            view = array.view()
-            view.flags.writeable = False
-            return view
 
-        return RawTable(read_only(self._flat), read_only(self._shape), read_only(self._bounds),
-                        self._domain_tol)
+        Raises
+        ------
+        ValueError
+            For ``blocked=False`` on a table stored in blocks.
+        """
+        if blocked is None:
+            blocked = not self._dense
+        if not blocked:
+            if not self._dense:
+                raise ValueError("This table is stored in blocks (see optimize(per_output=True)), so it "
+                                 "has no RawTable; use raw() and eval_blocked_into.")
+            return RawTable(_read_only(self._flat), _read_only(self._shape), _read_only(self._bounds),
+                            self._domain_tol)
+        packed = self._packed if self._packed is not None else pack_blocks(self._blocks, self.ndim,
+                                                                           self._dtype)
+        return RawBlockedTable(*(_read_only(a) for a in packed), self._n_out, _read_only(self._bounds),
+                               self._domain_tol)
 
     def _batch_points(self, points):
         """The array module of `points`, and `points` checked as a (B, d) float64 array."""
@@ -518,12 +700,21 @@ class ChebyshevInterpolantND:
         return self
 
     def _table_on(self, xp):
-        """The compact coefficients and bounds as arrays of module `xp`, cached per device."""
-        if xp is np:
+        """
+        The compact coefficients and bounds as arrays of module `xp`, cached
+        per device. For a table stored in blocks, the coefficients are a
+        :class:`~chebyshevnd.blocks.BlockedCoeffs`.
+        """
+        if xp is np and self._dense:
             return self._coeffs, self._a, self._b
         key = xp.__name__
         if key not in self._device_tables:
-            self._device_tables[key] = (xp.asarray(self._coeffs), xp.asarray(self._a), xp.asarray(self._b))
+            if self._dense:
+                table = xp.asarray(self._coeffs)
+            else:
+                table = BlockedCoeffs([c for c, _ in self._blocks], [o for _, o in self._blocks],
+                                      self._n_out, self._dtype, box=self._kmax).to(xp)
+            self._device_tables[key] = (table, xp.asarray(self._a), xp.asarray(self._b))
         return self._device_tables[key]
 
     def _domain_message(self, x, status):
@@ -602,10 +793,13 @@ class ChebyshevInterpolantND:
                 "Fixed value outside the interpolation domain: "
                 + self._domain_message(x, int(status[0])) + "."
             )
-        coeffs = tables[0]
+        if self._dense:
+            coeffs = tables[0]
+        else:
+            coeffs = [(t[0], o) for t, o in zip(tables.blocks, tables.outputs)]
         if self._coeffs_full is None:
             full = None
-        elif self._kmax == self._grid_shape:
+        elif self._untruncated:
             full = coeffs  # nothing was truncated, so the full tensor gives the same table
         else:
             full = self._precontract_tables(np, axes, row, full=True)[0][0]
@@ -619,6 +813,9 @@ class ChebyshevInterpolantND:
             domain_tol=self._domain_tol,
             abs_error=self._interp_error + self._discarded,
             grid_shape=[self._grid_shape[i] for i in live],
+            discarded_l2=self._discarded_l2,
+            truncation=self._truncation,
+            dtype=self._dtype,
         )
 
     def precontract_batch(self, fixed, return_status=False):
@@ -697,9 +894,20 @@ class ChebyshevInterpolantND:
             coeffs, a, b = (self._coeffs_full, self._a, self._b) if full else self._table_on(xp)
             live = [i for i in range(self.ndim) if i not in axes]
             order = list(axes) + live
-            table = xp.ascontiguousarray(xp.transpose(coeffs, order + [self.ndim]))
+            perm = order + [self.ndim]
+            if isinstance(coeffs, BlockedCoeffs):
+                table = [xp.ascontiguousarray(xp.transpose(c, perm)) for c in coeffs.blocks]
+            else:
+                table = xp.ascontiguousarray(xp.transpose(coeffs, perm))
             self._fixed_first[key] = (table, a[order], b[order])
         table, a, b = self._fixed_first[key]
+        if isinstance(table, list):
+            # A blocked table: one GEMM per block, the outputs keep their blocks
+            tables, status = precontract_blocks(table, a, b, len(axes), values, tol=self._domain_tol,
+                                                status_axes=axes)
+            box = tuple(k for i, k in enumerate(self._kmax) if i not in axes)
+            return BlockedCoeffs(tables, self._table_on(xp)[0].outputs, self._n_out, self._dtype,
+                                 box=box, members=values.shape[0], xp=xp), status
         return precontract_tables(table, a, b, range(len(axes)), values,
                                   tol=self._domain_tol, status_axes=axes)
 
@@ -787,21 +995,30 @@ class ChebyshevInterpolantND:
             time, e.g. in an ODE right-hand side.
         """
         orders = self._parse_orders(orders)
-        compact = self._differentiate(self._coeffs, orders)
+        derived = [(self._differentiate(c, orders), o) for c, o in self._blocks]
         full = None if self._coeffs_full is None else self._differentiate(self._coeffs_full, orders)
 
         # Differentiating removes the top `order` coefficients along each axis
-        keep = tuple(slice(max(k - o, 1)) for k, o in zip(self._kmax, orders))
+        kept = [(c[tuple(slice(max(k - o, 1)) for k, o in zip(c.shape[:-1], orders))], idx)
+                for c, idx in derived]
+        n_out = self._n_out
         if full is not None:
             meaningful = tuple(slice(max(n - o, 1)) for n, o in zip(self._grid_shape, orders))
             interp_error = _trailing_error_estimate(np.abs(full[meaningful]))
             padded = np.zeros_like(full)
-            padded[tuple(slice(k) for k in self._kmax)] = compact
+            for c, idx in derived:
+                padded[tuple(slice(k) for k in c.shape[:-1]) + (idx,)] = c
             # Exact bound on what the truncation contributes to the derivative
-            truncation = np.abs(full - padded).reshape(-1, full.shape[-1]).sum(axis=0)
+            removed = np.abs(full - padded).reshape(-1, n_out)
+            truncation = removed.sum(axis=0)
+            discarded_l2 = np.sqrt((removed ** 2).sum(axis=0))
         else:
-            interp_error = _trailing_error_estimate(np.abs(compact[keep]))
-            truncation = self._discarded * self._markov_factor(orders)
+            interp_error = np.zeros(n_out)
+            for c, idx in kept:
+                interp_error[idx] = _trailing_error_estimate(np.abs(c))
+            factor = self._markov_factor(orders)
+            truncation = self._discarded * factor
+            discarded_l2 = self._discarded_l2 * factor
 
         # Rounding noise in the coefficients, amplified by the same Markov
         # factor; it dominates once a function is resolved to rounding level
@@ -812,13 +1029,16 @@ class ChebyshevInterpolantND:
         rounding = np.finfo(np.float64).eps * self._scale * amplification if any(orders) else 0.0
 
         return ChebyshevInterpolantND._from_tables(
-            compact[keep], full, self._a, self._b,
+            kept[0][0] if self._dense else kept, full, self._a, self._b,
             nodes=self._nodes,
             axis_names=self._axis_names,
             output_names=self._output_names,
             domain_tol=self._domain_tol,
             abs_error=interp_error + truncation + rounding,
             grid_shape=self._grid_shape,
+            discarded_l2=discarded_l2,
+            truncation=self._truncation,
+            dtype=self._dtype,
         )
 
     def check_derivatives(self, orders, points, step=None):
@@ -879,7 +1099,8 @@ class ChebyshevInterpolantND:
                 p[:, ax] += s * h[ax]
             shifted.append(p)
         # Evaluate without the domain check: stencils may step just outside
-        values, _ = _evaluate_batch(self._coeffs, self._a, self._b, np.concatenate(shifted), tol=np.inf)
+        values, _ = _evaluate_batch(self._table_on(np)[0], self._a, self._b, np.concatenate(shifted),
+                                    tol=np.inf)
         values = values.reshape(len(stencil), len(pts), -1)
         finite_diff = sum(w * v for (w, _), v in zip(stencil, values)) / denominator
 
@@ -992,8 +1213,9 @@ class ChebyshevInterpolantND:
         ----------
         full : bool, optional
             If False (default), return the truncated block used for
-            evaluation, shape ``kmax``. If True, return the full tensor,
-            shape ``grid_shape``.
+            evaluation, shape ``kmax``; for a table stored in blocks, a
+            zero-filled dense copy of the blocks (see :attr:`blocks`). If
+            True, return the full tensor, shape ``grid_shape``.
 
         Returns
         -------
@@ -1005,8 +1227,10 @@ class ChebyshevInterpolantND:
             if self._coeffs_full is None:
                 raise RuntimeError("The full coefficient tensor was dropped by optimize(keep_full=False).")
             coeffs = self._coeffs_full
-        else:
+        elif self._dense:
             coeffs = self._coeffs
+        else:
+            coeffs = self._table_on(np)[0].to_dense()
         return coeffs[..., 0] if self._single else coeffs
 
     def absolute_error(self):
@@ -1060,8 +1284,13 @@ class ChebyshevInterpolantND:
             Computed from the full coefficient tensor if it is held,
             otherwise from the truncated one.
         """
-        coeffs = self._coeffs_full if self._coeffs_full is not None else self._coeffs
-        err = _trailing_errors_by_axis(np.abs(coeffs))
+        if self._coeffs_full is not None or self._dense:
+            coeffs = self._coeffs_full if self._coeffs_full is not None else self._coeffs
+            err = _trailing_errors_by_axis(np.abs(coeffs))
+        else:
+            err = np.zeros((self.ndim, self._n_out))
+            for c, idx in self._blocks:
+                err[:, idx] = _trailing_errors_by_axis(np.abs(c))
         if relative:
             err = np.where(self._scale > 0, err / np.where(self._scale > 0, self._scale, 1.0), 0.0)
         return err[:, 0] if self._single else err
@@ -1084,16 +1313,36 @@ class ChebyshevInterpolantND:
 
     # ------------------------------------------------------------- truncation
 
-    def optimize(self, rel_tol=1e-8, keep_full=True):
+    def optimize(self, rel_tol=1e-8, keep_full=True, *, groups=None, norm="l1", per_output=False,
+                 max_blocks=None):
         """
         Truncate the series by greedily removing trailing coefficient slices
-        while the sum of the removed magnitudes stays below
-        ``rel_tol`` times the largest coefficient magnitude. With a function
-        axis, one truncation is shared by all functions and the bound holds
-        for each function relative to its own largest coefficient.
+        while the removed coefficients stay within a budget.
+
+        By default, the budget is that the sum of the removed magnitudes stays
+        below ``rel_tol`` times the largest coefficient magnitude. With a
+        function axis, one truncation is shared by all functions and the
+        bound holds for each function relative to its own largest
+        coefficient.
+
+        For tables of many functions of very different sizes (e.g. the
+        Fourier harmonics of a few families of functions), three options
+        remove far more:
+
+        - ``groups`` measures each function against the largest coefficient
+          of its group, so a negligible member of a family is not resolved
+          to its own (noise) level;
+        - ``norm="l2"`` budgets the root-sum-square of the removed
+          coefficients instead of the sum of their magnitudes, which suits a
+          tail of interpolation noise, where many tiny coefficients add up
+          in magnitude but not in their typical effect;
+        - ``per_output=True`` truncates each function on its own, and stores
+          the functions in at most ``max_blocks`` dense blocks (see
+          :attr:`blocks`). A function whose whole series fits in its budget
+          is stored in no block and evaluates to exactly zero.
 
         Truncation always starts from the full tensor, so ``optimize`` can
-        be called again with a different tolerance.
+        be called again with other settings.
 
         Parameters
         ----------
@@ -1102,6 +1351,35 @@ class ChebyshevInterpolantND:
         keep_full : bool, optional
             If False, drop the full coefficient tensor to save memory. Later
             calls to ``optimize`` are then impossible.
+        groups : sequence or mapping, optional
+            The reference scale of each function's budget, ``rel_tol * S_g``,
+            with S_g the largest coefficient magnitude over the functions of
+            its group. A sequence of F hashable labels (one per function),
+            or a mapping from label to a sequence of function names or
+            indices that puts every function in exactly one group. By
+            default every function is its own group.
+        norm : {"l1", "l2"}, optional
+            ``"l1"`` (default): the sum of the removed magnitudes stays below
+            the budget, a rigorous bound on the error the truncation
+            introduces anywhere in the domain. ``"l2"``: their root-sum-square
+            does (see :attr:`discarded_l2`), an estimate of the typical error.
+        per_output : bool, optional
+            Truncate each function separately rather than all together.
+        max_blocks : int, optional
+            With ``per_output``, the most blocks to store the functions in:
+            functions with similar truncations share a block, whose shape
+            fits all of them. Fewer blocks store more coefficients (each
+            block is a box) but cost less per evaluation in the batched
+            NumPy/CuPy paths, which loop over blocks in Python. None
+            (default) stores each function in a block of its own.
+
+        Notes
+        -----
+        After truncation, :meth:`absolute_error` adds the sum of the removed
+        magnitudes to the interpolation estimate, whatever ``norm`` is, and
+        :attr:`discarded_l2` holds their root-sum-square. Both are computed
+        from what is actually stored: a function's block may keep more of
+        its coefficients than its own truncation would.
         """
         if self._coeffs_full is None:
             raise RuntimeError(
@@ -1110,20 +1388,74 @@ class ChebyshevInterpolantND:
             )
         if not 0.0 < rel_tol < 1.0:
             raise ValueError(f"rel_tol must lie in (0, 1), got {rel_tol}.")
+        if norm not in ("l1", "l2"):
+            raise ValueError(f"norm must be 'l1' or 'l2', got {norm!r}.")
+        if max_blocks is not None:
+            if not per_output:
+                raise ValueError("max_blocks applies to per_output=True; without it the table is "
+                                 "one block.")
+            if (isinstance(max_blocks, bool) or not isinstance(max_blocks, numbers.Integral)
+                    or max_blocks < 1):
+                raise ValueError(f"max_blocks must be a positive integer or None, got {max_blocks!r}.")
+            max_blocks = int(max_blocks)
+        labels = parse_groups(groups, self._output_names, self._n_out)
 
-        abs_c = np.abs(self._coeffs_full)
+        full = self._coeffs_full
+        abs_c = np.abs(full)
         n_out = abs_c.shape[-1]
-        # Normalise each output by its own scale; the greedy pruner then
-        # bounds every output's discarded sum by rel_tol times its scale
-        scale = np.where(self._scale > 0, self._scale, 1.0)
-        magnitude = (abs_c / scale).max(axis=-1)
-        kmax, _ = prune_trailing_slices_greedy_nd(magnitude, delta=rel_tol, scale=1.0)
-        kmax = tuple(max(1, int(k)) for k in kmax)
+        squared = norm == "l2"
+        delta = rel_tol ** 2 if squared else rel_tol
+        # Each output's reference scale: its own largest coefficient, or its group's
+        scale = self._scale if labels is None else group_scale(labels, self._scale)
+        if not per_output:
+            # Normalise each output by its scale; the greedy pruner then
+            # bounds every output's discarded sum by rel_tol times its scale
+            safe = np.where(scale > 0, scale, 1.0)
+            magnitude = (abs_c / safe).max(axis=-1)
+            if squared:
+                magnitude = magnitude ** 2
+            kmax, _ = prune_trailing_slices_greedy_nd(magnitude, delta=delta, scale=1.0)
+            kmax = tuple(max(1, int(k)) for k in kmax)
+            boxes = [(kmax, None)]
+        else:
+            own = np.zeros((n_out, self.ndim), dtype=np.int64)
+            for j in range(n_out):
+                if scale[j] == 0.0:
+                    continue  # the whole group is zero: store nothing
+                magnitude = abs_c[..., j] ** 2 if squared else abs_c[..., j]
+                k, _ = prune_trailing_slices_greedy_nd(magnitude, delta=delta,
+                                                       scale=float(scale[j]) ** (2 if squared else 1))
+                if min(k) > 0:
+                    own[j] = k
+            stored = np.flatnonzero(own[:, 0] > 0)
+            boxes = []
+            for run in partition_outputs(own[stored], max_blocks):
+                members = stored[run]
+                boxes.append((tuple(int(k) for k in own[members].max(axis=0)), members))
 
-        kept = abs_c[tuple(slice(k) for k in kmax)].reshape(-1, n_out).sum(axis=0)
+        # What the stored boxes keep, per output: L1 as the total minus the
+        # kept part; L2 directly from the removed part, which is far smaller
+        # than the total
+        squares = abs_c ** 2
         total = abs_c.reshape(-1, n_out).sum(axis=0)
+        kept = np.zeros(n_out)
+        removed_sq = squares.reshape(-1, n_out).sum(axis=0)  # everything, for outputs in no block
+        blocks = []
+        for box, members in boxes:
+            cut = tuple(slice(k) for k in box)
+            if members is None:
+                kept = abs_c[cut].reshape(-1, n_out).sum(axis=0)
+                removed_sq = outside_box_sum(squares, box)
+                blocks.append((full[cut], np.arange(n_out, dtype=np.int64)))
+            else:
+                kept[members] = abs_c[cut + (members,)].reshape(-1, len(members)).sum(axis=0)
+                removed_sq[members] = outside_box_sum(squares[..., members], box)
+                blocks.append((full[cut + (members,)], members))
         self._discarded = np.maximum(total - kept, 0.0)
-        self._set_truncation(kmax)
+        self._discarded_l2 = np.sqrt(removed_sq)
+        self._truncation = {"rel_tol": float(rel_tol), "norm": norm, "per_output": bool(per_output),
+                            "max_blocks": max_blocks, "groups": labels}
+        self._set_blocks(blocks, n_out, self._dtype)
         if not keep_full:
             self._coeffs_full = None
 
@@ -1139,11 +1471,22 @@ class ChebyshevInterpolantND:
         return self._kmax
 
     def __repr__(self):
+        blocks = ""
+        if not self._dense:
+            stored = sum(c.size for c, _ in self._blocks) / (np.prod(self._grid_shape) * self._n_out)
+            blocks = f"blocks={len(self._blocks)}, stored={stored:.1%}, "
         return (
             f"ChebyshevInterpolantND(axes={self._axis_names}, grid_shape={self._grid_shape}, "
-            f"kmax={self._kmax}, outputs={self.n_outputs}, nodes={self._nodes!r}, "
+            f"kmax={self._kmax}, outputs={self.n_outputs}, {blocks}nodes={self._nodes!r}, "
             f"dtype={self.dtype})"
         )
+
+
+def _read_only(array):
+    """A read-only view of `array`."""
+    view = array.view()
+    view.flags.writeable = False
+    return view
 
 
 def _member_values(raw):

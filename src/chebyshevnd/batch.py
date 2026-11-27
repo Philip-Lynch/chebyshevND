@@ -1,7 +1,8 @@
 """Per-member Chebyshev tables for a batch of members, e.g. waveforms."""
 
-from .backend import array_namespace, to_numpy
+from .backend import to_numpy
 from .batched import evaluate_batch, value_and_grad_batch
+from .blocks import BlockedCoeffs, table_namespace
 from .errors import OutOfDomainError, describe_out_of_domain
 
 
@@ -23,8 +24,10 @@ class ChebyshevBatch:
 
         Parameters
         ----------
-        tables : array, shape (B, k_1, ..., k_d, F)
-            One table per member (NumPy or CuPy).
+        tables : array, shape (B, k_1, ..., k_d, F), or BlockedCoeffs
+            One table per member (NumPy or CuPy); for a table stored in
+            blocks, a :class:`~chebyshevnd.blocks.BlockedCoeffs` of
+            per-member blocks.
         a, b : array, shape (d,)
             Lower and upper bound of each remaining axis.
         axis_names : sequence of str
@@ -35,7 +38,7 @@ class ChebyshevBatch:
             Allowed overshoot outside the domain, as a fraction of each
             axis's half-width.
         """
-        xp = array_namespace(tables)
+        xp = table_namespace(tables)
         self._tables = tables
         self._a = xp.asarray(a, dtype=xp.float64)
         self._b = xp.asarray(b, dtype=xp.float64)
@@ -91,8 +94,20 @@ class ChebyshevBatch:
         return self._tables.dtype
 
     @property
+    def n_blocks(self):
+        """Number of blocks each member's table is stored in (1 for a dense table)."""
+        return len(self._tables.blocks) if isinstance(self._tables, BlockedCoeffs) else 1
+
+    @property
     def tables(self):
-        """The per-member coefficient tables, shape (B, k_1, ..., k_d, F)."""
+        """
+        The per-member coefficient tables, shape (B, k_1, ..., k_d, F).
+
+        For a table stored in blocks, a zero-filled dense copy, made on
+        each access.
+        """
+        if isinstance(self._tables, BlockedCoeffs):
+            return self._tables.to_dense()
         return self._tables
 
     def evaluate(self, points, return_status=False):
@@ -177,7 +192,7 @@ class ChebyshevBatch:
 
     def _points(self, points):
         """The tables' array module, and `points` on that device, checked to be (B, d)."""
-        xp = array_namespace(self._tables)
+        xp = table_namespace(self._tables)
         pts = xp.asarray(points, dtype=xp.float64)
         if pts.ndim == 1 and self.ndim == 1:
             pts = pts[:, None]
@@ -201,7 +216,8 @@ class ChebyshevBatch:
             )
 
     def __repr__(self):
+        blocks = f"blocks={self.n_blocks}, " if isinstance(self._tables, BlockedCoeffs) else ""
         return (
             f"ChebyshevBatch(members={self.n_members}, axes={self._axis_names}, kmax={self.kmax}, "
-            f"outputs={self.n_outputs}, dtype={self.dtype})"
+            f"outputs={self.n_outputs}, {blocks}dtype={self.dtype})"
         )
