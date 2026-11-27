@@ -7,17 +7,26 @@ import pytest
 from numba import njit
 
 from chebyshevnd import (
+    AxisMap,
     ChebyshevBatch,
     ChebyshevInterpolantND,
+    MappedBatch,
+    MappedInterpolant,
     RawBlockedTable,
+    RawMappedBlockedTable,
     RawTable,
+    chebyshev_nodes,
     chebyshev_values_at_nodes_nd,
     eval_blocked_into,
     eval_grad_blocked_into,
+    eval_grad_physical_blocked_into,
+    eval_physical_blocked_into,
     prune_trailing_slices_greedy_nd,
 )
 from chebyshevnd.blocks import partition_outputs
 from helpers import decaying_coeffs
+import test_mapped
+from test_mapped import DOMAINS, MAPS, SHAPE, F, G, fit_mapped, make_boundary, random_physical
 
 SHAPES = {1: (14,), 2: (12, 9), 3: (10, 9, 7), 4: (8, 7, 6, 5), 5: (6, 6, 5, 4, 4)}
 NAMES = ["x", "y", "z", "u", "v"]
@@ -510,6 +519,179 @@ def test_blocked_entry_points_check_their_arguments():
     bad = raw._replace(out_index=np.full_like(raw.out_index, raw.n_outputs))
     with pytest.raises(ValueError, match="inconsistent"):
         eval_blocked_into(*bad, x, scratch, work, out)
+
+
+# ------------------------------------------------------------ mapped tables
+
+MAPPED_FUNCS = {
+    float: [F, lambda *x: 1e-3 * F(*x) * np.cos(x[1]), lambda *x: 1e-6 * F(*x) ** 2,
+            lambda *x: 1e-14 * F(*x)],
+    complex: [G, F, lambda *x: 1e-4 * G(*x) ** 2, lambda *x: 1e-14 * G(*x)],
+}
+
+
+def mapped_pair(dtype, boundary, max_blocks=2):
+    """A blocked MappedInterpolant, and the dense one with the same coefficients."""
+    names = ["r", "p", "e", "q"]
+    m = fit_mapped(names, SHAPE, DOMAINS, MAPS, boundary, MAPPED_FUNCS[dtype],
+                   output_names=["f0", "f1", "f2", "f3"])
+    m.optimize(1e-9, groups=[0, 0, 0, 0], norm="l2", per_output=True, max_blocks=max_blocks,
+               keep_full=False)
+    return m, MappedInterpolant(dense_like(m.table), MAPS, boundary)
+
+
+@pytest.fixture(scope="module")
+def boundary():
+    return make_boundary()
+
+
+@pytest.mark.parametrize("dtype", [float, complex])
+def test_mapped_blocked_matches_dense(dtype, boundary):
+    m, ref = mapped_pair(dtype, boundary)
+    assert not m.table._dense and m.table.output_kmax[3, 0] == 0  # the 1e-14 output is empty
+    scale = np.abs(m.table.get_coefficients()).max()
+    x = random_physical(30, seed=3, margin=0.01)
+    assert_close([m.evaluate(*p) for p in x], [ref.evaluate(*p) for p in x], scale)
+    for p in x[:6]:
+        (v, g), (rv, rg) = m.value_and_grad(*p), ref.value_and_grad(*p)
+        assert_close(v, rv, scale)
+        assert_close(g, rg, 1e3 * scale)
+    assert_close(m.evaluate_batch(x), ref.evaluate_batch(x), scale)
+    for got, want in zip(m.value_and_grad_batch(x), ref.value_and_grad_batch(x)):
+        assert_close(got, want, 1e3 * scale)
+    for got, want in zip(m.value_grad_hess_batch(x[:8]), ref.value_grad_hess_batch(x[:8])):
+        assert_close(got, want, 1e6 * scale)
+    assert np.all(m.evaluate_batch(x)[:, 3] == 0)
+
+
+def physical_points(n, seed, r=None, e=None):
+    """Random physical points in the mapped region, with r and/or e fixed if given."""
+    rng = np.random.default_rng(seed)
+    r = rng.uniform(6.0, 16.0, n) if r is None else np.full(n, r)
+    e = rng.uniform(0.0, 0.5, n) if e is None else np.full(n, e)
+    lo, width, sep = (test_mapped.lo(r, e), test_mapped.w(r, e), test_mapped.sep(r, e))
+    p = lo + width * rng.uniform(0.01, 0.99, n)
+    q = sep + (5 - sep) * rng.uniform(0.01, 0.99, n)
+    return np.stack([r, p, e, q], axis=1)
+
+
+@pytest.mark.parametrize("dtype", [float, complex])
+@pytest.mark.parametrize("fixed_axes", [("r", "e"), ("e",), ("r", "e", "q")])
+def test_mapped_blocked_precontraction(dtype, fixed_axes, boundary):
+    m, ref = mapped_pair(dtype, boundary)
+    scale = np.abs(m.table.get_coefficients()).max()
+    names = ["r", "p", "e", "q"]
+    cols = [names.index(a) for a in fixed_axes]
+    live = [i for i in range(4) if i not in cols]
+    # Both boundary inputs fixed (the boundary becomes numbers), or only e
+    # (the boundary table is precontracted too)
+    x0 = physical_points(1, seed=4)[0]
+    x = physical_points(30, seed=5, r=x0[0] if "r" in fixed_axes else None,
+                        e=x0[2] if "e" in fixed_axes else None)
+    if "q" in fixed_axes:
+        x[:, 3] = x0[3]  # inside the window: r and e are fixed at x0's values too
+    fixed = {a: float(x0[c]) for a, c in zip(fixed_axes, cols)}
+    got, want = m.precontract(fixed), ref.precontract(fixed)
+    assert not got.table._dense
+    pts = x[:, live]
+    assert_close(got.evaluate_batch(pts), want.evaluate_batch(pts), scale)
+    assert_close([got.evaluate(*p) for p in pts[:4]], [want.evaluate(*p) for p in pts[:4]], scale)
+    for g, w in zip(got.value_and_grad_batch(pts), want.value_and_grad_batch(pts)):
+        assert_close(g, w, 1e3 * scale)
+
+    members = physical_points(30, seed=6)
+    batch = {a: members[:, c] for a, c in zip(fixed_axes, cols)}
+    got_b, want_b = m.precontract_batch(batch), ref.precontract_batch(batch)
+    assert isinstance(got_b, MappedBatch)
+    assert_close(got_b.evaluate(members[:, live]), want_b.evaluate(members[:, live]), scale)
+    for g, w in zip(got_b.value_and_grad(members[:, live]), want_b.value_and_grad(members[:, live])):
+        assert_close(g, w, 1e3 * scale)
+
+
+@njit
+def user_mapped(coeffs, offsets, shapes, out_index, out_offsets, n_outputs, bounds, tol, codes,
+                params, bcoeffs, bshape, bbounds, baxes, x, scratch, work, out, grad):
+    s = eval_physical_blocked_into(coeffs, offsets, shapes, out_index, out_offsets, n_outputs, bounds,
+                                   tol, codes, params, bcoeffs, bshape, bbounds, baxes, x, scratch,
+                                   work, out)
+    s |= eval_grad_physical_blocked_into(coeffs, offsets, shapes, out_index, out_offsets, n_outputs,
+                                         bounds, tol, codes, params, bcoeffs, bshape, bbounds, baxes,
+                                         x, scratch, work, grad)
+    return s
+
+
+def test_mapped_blocked_raw_from_user_njit(boundary):
+    m, _ = mapped_pair(complex, boundary)
+    raw = m.raw()
+    assert isinstance(raw, RawMappedBlockedTable) and raw.n_blocks == len(m.table.blocks)
+    ws = raw.workspace()
+    out = np.empty(4, dtype=complex)
+    grad = np.empty((5, 4), dtype=complex)
+    for p in random_physical(4, seed=6, margin=0.01):
+        assert user_mapped(*raw, p, *ws, out, grad) == 0
+        v, g = m.value_and_grad(*p)
+        np.testing.assert_array_equal(out, m.evaluate(*p))
+        np.testing.assert_array_equal(grad[0], v)
+        np.testing.assert_array_equal(grad[1:], g)
+    with pytest.raises(ValueError, match="workspace too small"):
+        eval_physical_blocked_into(*raw, p, ws.scratch[:5], ws.work, out)
+    with pytest.raises(ValueError):
+        m.raw(blocked=False)
+
+
+def test_mapped_raw_blocked_for_a_dense_table(boundary):
+    names = ["r", "p", "e", "q"]
+    m = fit_mapped(names, SHAPE, DOMAINS, MAPS, boundary, [F, G], output_names=["F", "G"])
+    raw = m.raw(blocked=True)
+    assert isinstance(raw, RawMappedBlockedTable)
+    out = np.empty(2, dtype=complex)
+    p = random_physical(1, seed=2, margin=0.01)[0]
+    eval_physical_blocked_into(*raw, p, *raw.workspace(), out)
+    np.testing.assert_allclose(out, m.evaluate(*p), rtol=0, atol=1e-15)
+
+
+def test_mapped_without_boundary():
+    u = chebyshev_nodes(20, 1 / 16, 1 / 6)
+    e = chebyshev_nodes(9, 0.0, 0.5)
+    uu, ee = np.meshgrid(u, e, indexing="ij")
+    vals = np.stack([np.sin(2 * uu) * (1 + ee), 1e-5 * uu * ee, 1e-15 * uu], axis=-1)
+    table = ChebyshevInterpolantND(vals, [(1 / 16, 1 / 6), (0.0, 0.5)], axis_names=["r", "e"],
+                                   output_names=["a", "b", "c"])
+    m = MappedInterpolant(table, {"r": AxisMap("power", power=-1)})
+    dense = MappedInterpolant(ChebyshevInterpolantND(vals, table.domains, axis_names=["r", "e"],
+                                                     output_names=["a", "b", "c"]),
+                              {"r": AxisMap("power", power=-1)})
+    m.optimize(1e-10, groups=["g"] * 3, per_output=True)
+    assert m.table.output_kmax[2, 0] == 0
+    x = np.stack([np.linspace(6.5, 15.5, 7), np.linspace(0.05, 0.45, 7)], axis=1)
+    np.testing.assert_allclose(m.evaluate_batch(x), dense.evaluate_batch(x), rtol=0, atol=1e-9)
+    np.testing.assert_allclose([m.evaluate(*p) for p in x], dense.evaluate_batch(x), rtol=0, atol=1e-9)
+
+
+def test_mapped_caches_follow_the_table(boundary):
+    names = ["r", "p", "e", "q"]
+    m = fit_mapped(names, SHAPE, DOMAINS, MAPS, boundary, MAPPED_FUNCS[float],
+                   output_names=["f0", "f1", "f2", "f3"])
+    p = random_physical(1, seed=8, margin=0.01)[0]
+    before = m.evaluate(*p)
+    assert isinstance(m.raw(), type(m.raw(blocked=False)))
+    # Optimizing the wrapped table directly, after evaluating, must not
+    # leave the wrapper evaluating the old tables
+    m.table.optimize(1e-9, groups=[0] * 4, per_output=True)
+    assert isinstance(m.raw(), RawMappedBlockedTable)
+    after = m.evaluate(*p)
+    assert after[3] == 0 and before[3] != 0
+    np.testing.assert_allclose(after[:3], before[:3], rtol=0, atol=1e-8)
+    np.testing.assert_array_equal(m.evaluate_batch(p[None])[0], after)
+
+
+def test_blocked_boundary_tables_are_refused(boundary):
+    blocked = make_boundary()
+    blocked.optimize(1e-6, per_output=True)
+    names = ["r", "p", "e", "q"]
+    table = fit_mapped(names, SHAPE, DOMAINS, MAPS, boundary, [F]).table
+    with pytest.raises(NotImplementedError, match="boundary"):
+        MappedInterpolant(table, MAPS, blocked)
 
 
 # --------------------------------------------------------------------- GPU

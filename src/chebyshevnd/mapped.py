@@ -5,13 +5,17 @@ import numpy as np
 from .backend import array_namespace, resolve_device, to_numpy
 from .batched import evaluate_batch as _evaluate_batch
 from .batched import value_and_grad_batch as _value_and_grad_batch
+from .blocks import table_namespace
 from .errors import OutOfDomainError
 from .interpnd import ChebyshevInterpolantND, _member_values
 from .maps import (
     AxisMap,
+    RawMappedBlockedTable,
     RawMappedTable,
     dependent_axes,
+    eval_grad_physical_blocked_into,
     eval_grad_physical_into,
+    eval_physical_blocked_into,
     eval_physical_into,
     forward_map,
     inverse_map,
@@ -34,9 +38,9 @@ class MappedInterpolant:
 
     Every method takes and returns physical coordinates, and derivatives are
     with respect to physical coordinates (the chain rule through the maps,
-    including the boundary functions, is applied). Box-level operations
-    (``optimize``, ``derivative``, ...) are done on :attr:`table` before
-    wrapping it.
+    including the boundary functions, is applied). :meth:`optimize` works
+    on the wrapped table in place; other box-level operations
+    (``derivative``, ...) are done on :attr:`table` before wrapping it.
 
     Evaluation reuses buffers held by the instance, so one instance must not
     be evaluated from several threads at once.
@@ -77,6 +81,18 @@ class MappedInterpolant:
         self._raw = None
         self._buffers = None
         self._device = {}
+        self._cached_for = table._blocks
+
+    def _fresh(self):
+        """
+        Drop the cached arrays if the table was optimized since they were made
+        (``optimize`` replaces its blocks), so they never go stale.
+        """
+        if self._cached_for is not self._table._blocks:
+            self._raw = None
+            self._buffers = None
+            self._device = {}
+            self._cached_for = self._table._blocks
 
     # ------------------------------------------------------------- properties
 
@@ -197,9 +213,9 @@ class MappedInterpolant:
             If the point maps outside the table's domain (or the boundary
             table's), or a map is undefined there.
         """
-        args, out, _ = self._single_buffers()
+        args, out, _, kernel, _ = self._single_buffers()
         x = self._point(xs, "evaluate")
-        status = eval_physical_into(*args, out)
+        status = kernel(*args, out)
         if status:
             self._raise_point(x, status)
         return out.item(0) if not self.output_names else out.copy()
@@ -226,30 +242,42 @@ class MappedInterpolant:
         OutOfDomainError
             As for :meth:`evaluate`.
         """
-        args, _, out = self._single_buffers()
+        args, _, out, _, kernel = self._single_buffers()
         x = self._point(xs, "value_and_grad")
-        status = eval_grad_physical_into(*args, out)
+        status = kernel(*args, out)
         if status:
             self._raise_point(x, status)
         if not self.output_names:
             return out[0, 0].item(), out[1:, 0].copy()
         return out[0].copy(), out[1:].copy()
 
-    def raw(self):
+    def raw(self, blocked=None):
         """
         The mapped table as plain arrays, for the user's own Numba code.
 
         Precontract first, then pass the fields to an ``@njit`` function
         and evaluate there with :func:`chebyshevnd.eval_physical_into` or
-        :func:`chebyshevnd.eval_grad_physical_into`.
+        :func:`chebyshevnd.eval_grad_physical_into`; for a table stored in
+        blocks (after ``optimize(per_output=True)``), with
+        :func:`chebyshevnd.eval_physical_blocked_into` or
+        :func:`chebyshevnd.eval_grad_physical_blocked_into`.
+
+        Parameters
+        ----------
+        blocked : bool, optional
+            As for :meth:`ChebyshevInterpolantND.raw`: None (default) gives
+            the form that matches the table, True the blocked form for any
+            table, False the dense form (dense tables only).
 
         Returns
         -------
-        RawMappedTable
+        RawMappedTable or RawMappedBlockedTable
             Read-only views; a snapshot of the current tables.
         """
-        if self._raw is None:
-            t = self._table.raw()
+        self._fresh()
+        key = (not self._table._dense) if blocked is None else bool(blocked)
+        if self._raw is None or self._raw[0] != key:
+            t = self._table.raw(blocked=key)
             if self._boundary is None:
                 bcoeffs, bshape = np.zeros(1), np.zeros(0, dtype=np.int64)
                 bbounds, baxes = np.zeros((2, 0)), np.zeros(0, dtype=np.int64)
@@ -257,9 +285,13 @@ class MappedInterpolant:
                 b = self._boundary.raw()
                 bcoeffs, bshape, bbounds = b.coeffs, b.shape, b.bounds
                 baxes = np.array(self._baxes, dtype=np.int64)
-            self._raw = RawMappedTable(t.coeffs, t.shape, t.bounds, t.tol, *map(_read_only, (
-                self._codes, self._params, bcoeffs, bshape, bbounds, baxes)))
-        return self._raw
+            maps = tuple(map(_read_only, (self._codes, self._params, bcoeffs, bshape, bbounds, baxes)))
+            if key:
+                raw = RawMappedBlockedTable(*t, *maps)
+            else:
+                raw = RawMappedTable(t.coeffs, t.shape, t.bounds, t.tol, *maps)
+            self._raw = (key, raw)
+        return self._raw[1]
 
     # ------------------------------------------------------------- batches
 
@@ -489,7 +521,7 @@ class MappedInterpolant:
                     remaining = self._boundary.axis_names
                 baxes = [live.index(names.index(n)) for n in remaining]
 
-        result = MappedBatch(batch.tables, *(xp.asarray(v) for v in zip(*batch.domains)), codes,
+        result = MappedBatch(batch._tables, *(xp.asarray(v) for v in zip(*batch.domains)), codes,
                              params, boundary, baxes, axis_names=[names[a] for a in live],
                              output_names=self.output_names, domain_tol=self.domain_tol,
                              maps=[self._maps[a] for a in live])
@@ -536,6 +568,24 @@ class MappedInterpolant:
         weights = xp.asarray([1 << ax for ax in axes], dtype=xp.int64)
         return y, bvals, bits | (outside * weights).sum(axis=1)
 
+    def optimize(self, rel_tol=1e-8, keep_full=True, *, groups=None, norm="l1", per_output=False,
+                 max_blocks=None):
+        """
+        Truncate the table's series, in place.
+
+        Calls :meth:`ChebyshevInterpolantND.optimize` on :attr:`table`, with
+        the same arguments, and keeps the maps and the boundary table. The
+        truncation is measured in table coordinates, where the series lives.
+
+        Parameters
+        ----------
+        rel_tol, keep_full, groups, norm, per_output, max_blocks
+            As for :meth:`ChebyshevInterpolantND.optimize`.
+        """
+        self._table.optimize(rel_tol, keep_full, groups=groups, norm=norm, per_output=per_output,
+                             max_blocks=max_blocks)
+        self._fresh()
+
     def to_device(self, device="cuda"):
         """
         Copy the table, the boundary table and the maps to a device now.
@@ -559,6 +609,7 @@ class MappedInterpolant:
 
     def _on(self, xp):
         """The tables and packed parameters as arrays of module ``xp``, cached per device."""
+        self._fresh()
         key = xp.__name__
         if key not in self._device:
             coeffs, a, b = self._table._table_on(xp)
@@ -570,18 +621,24 @@ class MappedInterpolant:
     def _single_buffers(self):
         """
         Kernel arguments up to (not including) ``out``, with the point buffer
-        ``self._x`` in place of x, and the output arrays for values and for
-        values + gradients. Built once, so a call only fills ``self._x``.
+        ``self._x`` in place of x, the output arrays for values and for
+        values + gradients, and the kernels for the two (dense or blocked).
+        Built once, so a call only fills ``self._x``.
         """
+        if self._cached_for is not self._table._blocks:
+            self._fresh()
         if self._buffers is None:
             raw = self.raw()
             # The same arrays as raw(), but writable: Numba dispatches
             # read-only arrays more slowly
             arrays = [np.array(a) if isinstance(a, np.ndarray) else a for a in raw]
             self._x = np.empty(self.ndim)
+            blocked = isinstance(raw, RawMappedBlockedTable)
             self._buffers = ((*arrays, self._x, *raw.workspace()),
                              np.empty(self.n_outputs, dtype=self.dtype),
-                             np.empty((self.ndim + 1, self.n_outputs), dtype=self.dtype))
+                             np.empty((self.ndim + 1, self.n_outputs), dtype=self.dtype),
+                             eval_physical_blocked_into if blocked else eval_physical_into,
+                             eval_grad_physical_blocked_into if blocked else eval_grad_physical_into)
         return self._buffers
 
     def _point(self, xs, method):
@@ -747,7 +804,7 @@ class MappedBatch:
         return self._finish(xp, pts, status, return_status, values, grads)
 
     def _points(self, points):
-        xp = array_namespace(self._tables)
+        xp = table_namespace(self._tables)
         pts = xp.asarray(points, dtype=xp.float64)
         if pts.ndim == 1 and self.ndim == 1:
             pts = pts[:, None]
@@ -811,6 +868,10 @@ def validate_maps(names, maps, boundary):
         raise TypeError("boundary must be a ChebyshevInterpolantND.")
     if boundary.dtype.kind == "c":
         raise ValueError("The boundary table must be real.")
+    if not boundary._dense:
+        raise NotImplementedError(
+            "The boundary table is stored in blocks (optimize(per_output=True)), which boundary "
+            "tables do not support; optimize it with per_output=False.")
     if not boundary.output_names:
         raise ValueError("The boundary table needs output_names, so maps can refer to them.")
     missing = [r for r in references if r not in boundary.output_index]
