@@ -94,6 +94,24 @@ and evaluate inside ``@njit`` code with these functions.
 .. autoclass:: chebyshevnd.RawMappedTable
    :members: ndim, n_outputs, dtype, workspace
 
+Tables stored in blocks (after ``optimize(per_output=True)``) have their own
+entry points; ``raw(blocked=True)`` gives this form for any table, so one
+right-hand side can serve dense and blocked tables alike.
+
+.. autofunction:: chebyshevnd.eval_blocked_into
+
+.. autofunction:: chebyshevnd.eval_grad_blocked_into
+
+.. autoclass:: chebyshevnd.RawBlockedTable
+   :members: ndim, n_blocks, dtype, workspace
+
+.. autofunction:: chebyshevnd.eval_physical_blocked_into
+
+.. autofunction:: chebyshevnd.eval_grad_physical_blocked_into
+
+.. autoclass:: chebyshevnd.RawMappedBlockedTable
+   :members: ndim, n_blocks, dtype, workspace
+
 Batched evaluation (NumPy and CuPy)
 -----------------------------------
 

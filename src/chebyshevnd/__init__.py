@@ -13,8 +13,24 @@ from .interpnd import ChebyshevInterpolantND
 from .batch import ChebyshevBatch
 from .batched import evaluate_batch, value_and_grad_batch
 from .derivatives import differentiate_coefficients
-from .kernels import RawTable, Workspace, eval_grad_into, eval_into
-from .maps import AxisMap, RawMappedTable, eval_grad_physical_into, eval_physical_into
+from .kernels import (
+    RawBlockedTable,
+    RawTable,
+    Workspace,
+    eval_blocked_into,
+    eval_grad_blocked_into,
+    eval_grad_into,
+    eval_into,
+)
+from .maps import (
+    AxisMap,
+    RawMappedBlockedTable,
+    RawMappedTable,
+    eval_grad_physical_blocked_into,
+    eval_grad_physical_into,
+    eval_physical_blocked_into,
+    eval_physical_into,
+)
 from .mapped import MappedBatch, MappedInterpolant
 from .grid import Axis, ChebyshevGrid
 from .io import load, read_metadata, save
@@ -54,12 +70,18 @@ __all__ = [
     "Workspace",
     "eval_into",
     "eval_grad_into",
+    "RawBlockedTable",
+    "eval_blocked_into",
+    "eval_grad_blocked_into",
     "AxisMap",
     "MappedInterpolant",
     "MappedBatch",
     "RawMappedTable",
     "eval_physical_into",
     "eval_grad_physical_into",
+    "RawMappedBlockedTable",
+    "eval_physical_blocked_into",
+    "eval_grad_physical_blocked_into",
     "Axis",
     "ChebyshevGrid",
     "save",

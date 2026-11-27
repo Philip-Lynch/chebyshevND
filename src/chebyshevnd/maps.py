@@ -39,7 +39,15 @@ from typing import NamedTuple
 import numpy as np
 from numba import njit
 
-from .kernels import Workspace, evaluate_point, value_and_grad_point
+from .kernels import (
+    Workspace,
+    _blocked_layout,
+    blocked_sizes,
+    evaluate_blocks_point,
+    evaluate_point,
+    value_and_grad_blocks_point,
+    value_and_grad_point,
+)
 
 #: Transform codes, in the packed ``codes[:, 0]`` column
 TRANSFORMS = {"identity": 0, "log": 1, "power": 2}
@@ -793,3 +801,194 @@ class RawMappedTable(NamedTuple):
         rest = self.coeffs.shape[0] // int(self.shape[0])
         return Workspace(np.empty(mapped_scratch_size(self.shape, self.bcoeffs, self.bshape)),
                          np.empty((2 * (d + 1), rest), dtype=self.coeffs.dtype))
+
+
+# ------------------------------------------------------------ blocked tables
+
+
+@njit(cache=True)
+def _boundary_scratch_size(bcoeffs, bshape):
+    """Length of the float64 scratch the boundary table needs in :func:`_map_point`."""
+    db = bshape.shape[0]
+    if db == 0:
+        return 0
+    mb = 0
+    bsize = 1
+    for i in range(db):
+        mb = max(mb, bshape[i])
+        bsize *= bshape[i]
+    n_out = bcoeffs.shape[0] // bsize
+    rest = bcoeffs.shape[0] // bshape[0]
+    return db + (db + 2 * mb) + (db + 1) * n_out + 2 * (db + 1) * rest
+
+
+@njit(cache=True)
+def _check_mapped_blocked_call(coeffs, offsets, shapes, out_index, out_offsets, n_outputs, codes,
+                               bcoeffs, bshape, x, scratch, work, rows, gradient):
+    """Raise if the arrays passed to the blocked mapped kernels do not fit the table."""
+    d = shapes.shape[1]
+    if x.shape[0] != d or codes.shape[0] != d:
+        raise ValueError("x and the maps must have one entry per axis of the table")
+    if rows != n_outputs:
+        raise ValueError("out does not have one entry per output of the table")
+    m, rest = _blocked_layout(coeffs, offsets, shapes, out_index, out_offsets, n_outputs)
+    need_rows = 3 * (d + 1) if gradient else 3
+    need_scratch = d + d * d + d + 2 * m + _boundary_scratch_size(bcoeffs, bshape)
+    if scratch.shape[0] < need_scratch or work.shape[0] < need_rows or work.shape[1] < rest:
+        raise ValueError("workspace too small for this table; make it with table.workspace()")
+
+
+@njit(cache=True)
+def eval_physical_blocked_into(coeffs, offsets, shapes, out_index, out_offsets, n_outputs, bounds, tol,
+                               codes, params, bcoeffs, bshape, bbounds, baxes, x, scratch, work, out):
+    """
+    Evaluate a mapped blocked table at a point in physical coordinates, into ``out``.
+
+    The counterpart of :func:`eval_physical_into` for a
+    :class:`~chebyshevnd.MappedInterpolant` whose table is stored in blocks
+    (after ``optimize(per_output=True)``); the fields of a
+    :class:`RawMappedBlockedTable` come first, then the point, the
+    workspace and ``out``.
+
+    Parameters
+    ----------
+    coeffs, offsets, shapes, out_index, out_offsets, n_outputs, bounds, tol, codes, params, bcoeffs,
+    bshape, bbounds, baxes
+        The fields of a :class:`RawMappedBlockedTable`.
+    x : 1D float64 array
+        The point in physical coordinates.
+    scratch, work
+        The fields of a :class:`~chebyshevnd.Workspace` from
+        ``table.workspace()``.
+    out : 1D array, shape (F,)
+        Receives the outputs; zero for outputs stored in no block.
+
+    Returns
+    -------
+    int
+        Status bitmask, as for :func:`eval_physical_into`.
+    """
+    _check_mapped_blocked_call(coeffs, offsets, shapes, out_index, out_offsets, n_outputs, codes,
+                               bcoeffs, bshape, x, scratch, work, out.shape[0], False)
+    status, off = _map_point(codes, params, bcoeffs, bshape, bbounds, baxes, tol, x, scratch, False)
+    d = shapes.shape[1]
+    status |= evaluate_blocks_point(coeffs, offsets, shapes, out_index, out_offsets, bounds,
+                                    scratch[:d], tol, scratch[off:], work, out)
+    return status
+
+
+@njit(cache=True)
+def eval_grad_physical_blocked_into(coeffs, offsets, shapes, out_index, out_offsets, n_outputs, bounds,
+                                    tol, codes, params, bcoeffs, bshape, bbounds, baxes, x, scratch,
+                                    work, out):
+    """
+    Evaluate a mapped blocked table and its physical gradient, into ``out``.
+
+    The counterpart of :func:`eval_grad_physical_into` for tables stored in
+    blocks.
+
+    Parameters
+    ----------
+    coeffs, offsets, shapes, out_index, out_offsets, n_outputs, bounds, tol, codes, params, bcoeffs,
+    bshape, bbounds, baxes, x, scratch, work
+        As for :func:`eval_physical_blocked_into`.
+    out : 2D array, shape (d + 1, F)
+        Row 0 receives the outputs, row i + 1 their derivatives with respect
+        to physical coordinate i.
+
+    Returns
+    -------
+    int
+        Status bitmask, as for :func:`eval_physical_into`.
+    """
+    d = shapes.shape[1]
+    if out.shape[0] != d + 1:
+        raise ValueError("out must have shape (d + 1, F)")
+    _check_mapped_blocked_call(coeffs, offsets, shapes, out_index, out_offsets, n_outputs, codes,
+                               bcoeffs, bshape, x, scratch, work, out.shape[1], True)
+    status, off = _map_point(codes, params, bcoeffs, bshape, bbounds, baxes, tol, x, scratch, True)
+    status |= value_and_grad_blocks_point(coeffs, offsets, shapes, out_index, out_offsets, bounds,
+                                          scratch[:d], tol, scratch[off:], work, out)
+
+    # Chain rule in place, as in eval_grad_physical_into
+    jac = scratch[d:d + d * d].reshape((d, d))
+    n_out = out.shape[1]
+    for i in range(d):
+        if codes[i, 1] < 0 and codes[i, 2] < 0:
+            for f in range(n_out):
+                g = out[1 + i, f] * jac[i, i]
+                for a in range(d):
+                    if a != i and jac[a, i] != 0.0:
+                        g += out[1 + a, f] * jac[a, i]
+                out[1 + i, f] = g
+    for a in range(d):
+        if codes[a, 1] >= 0 or codes[a, 2] >= 0:
+            for f in range(n_out):
+                out[1 + a, f] *= jac[a, a]
+    return status
+
+
+class RawMappedBlockedTable(NamedTuple):
+    """
+    A mapped interpolant whose table is stored in blocks, as plain arrays.
+
+    Returned by :meth:`MappedInterpolant.raw` when the table is stored in
+    blocks (after ``optimize(per_output=True)``), or for any table with
+    ``raw(blocked=True)``. The fields are the first fourteen arguments of
+    :func:`eval_physical_blocked_into` and
+    :func:`eval_grad_physical_blocked_into`, in order, so from Python
+    ``eval_physical_blocked_into(*table, x, *ws, out)`` works. Pass them to
+    your own ``@njit`` functions as separate arguments.
+
+    Attributes
+    ----------
+    coeffs, offsets, shapes, out_index, out_offsets, n_outputs, bounds, tol
+        The table, as in :class:`~chebyshevnd.RawBlockedTable`.
+    codes, params, bcoeffs, bshape, bbounds, baxes
+        The maps and the boundary table, as in :class:`RawMappedTable`.
+    """
+
+    coeffs: np.ndarray
+    offsets: np.ndarray
+    shapes: np.ndarray
+    out_index: np.ndarray
+    out_offsets: np.ndarray
+    n_outputs: int
+    bounds: np.ndarray
+    tol: float
+    codes: np.ndarray
+    params: np.ndarray
+    bcoeffs: np.ndarray
+    bshape: np.ndarray
+    bbounds: np.ndarray
+    baxes: np.ndarray
+
+    @property
+    def ndim(self):
+        """Number of axes d."""
+        return int(self.shapes.shape[1])
+
+    @property
+    def n_blocks(self):
+        """Number of blocks."""
+        return int(self.offsets.shape[0] - 1)
+
+    @property
+    def dtype(self):
+        """Coefficient dtype, and the dtype of the ``out`` arrays."""
+        return self.coeffs.dtype
+
+    def workspace(self):
+        """
+        Allocate scratch space for evaluating this table.
+
+        Returns
+        -------
+        Workspace
+            Serves both :func:`eval_physical_blocked_into` and
+            :func:`eval_grad_physical_blocked_into`; one per thread.
+        """
+        m, rest = blocked_sizes(self.shapes, self.out_offsets)
+        d = self.ndim
+        size = d + d * d + d + 2 * m + int(_boundary_scratch_size(self.bcoeffs, self.bshape))
+        return Workspace(np.empty(size), np.empty((3 * (d + 1), rest), dtype=self.coeffs.dtype))

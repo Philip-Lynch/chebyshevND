@@ -248,6 +248,102 @@ def value_and_grad_point(coeffs, shape, bounds, xs, tol, scratch, work, out):
     return status
 
 
+# ----------------------------------------------------------- blocked tables
+#
+# A blocked table stores its outputs in several dense blocks (see
+# chebyshevnd.blocks). Its arrays are the concatenated, flattened blocks
+# ``coeffs`` with block b at ``coeffs[offsets[b]:offsets[b + 1]]``, each
+# block's (k_1, ..., k_d) as row b of ``shapes``, and each block's output
+# indices at ``out_index[out_offsets[b]:out_offsets[b + 1]]``. Outputs in no
+# block are zero.
+
+
+@njit(cache=True)
+def evaluate_blocks_point(coeffs, offsets, shapes, out_index, out_offsets, bounds, xs, tol,
+                          scratch, work, out):
+    """
+    Map ``xs`` to [-1, 1]^d and evaluate a blocked table there.
+
+    Each block is contracted with :func:`contract` into row 2 of ``work``,
+    and its outputs are copied to their places in ``out``; outputs in no
+    block are set to zero.
+
+    Parameters
+    ----------
+    coeffs, offsets, shapes, out_index, out_offsets
+        The blocked table (see the comment above).
+    bounds, xs, tol
+        As for :func:`evaluate_point`.
+    scratch : 1D float64 array
+        Length >= d + max k over the blocks.
+    work : 2D array, shape (>= 3, >= max over blocks of k_2 * ... * k_d * F_b)
+        Scratch space, same dtype as ``coeffs``.
+    out : 1D array, shape (F,)
+
+    Returns
+    -------
+    int
+        Status bitmask, as for :func:`evaluate_point`.
+    """
+    d = shapes.shape[1]
+    ts = scratch[:d]
+    status = _map_to_box(bounds, xs, tol, ts)
+    for f in range(out.shape[0]):
+        out[f] = 0.0
+    for blk in range(offsets.shape[0] - 1):
+        f0 = out_offsets[blk]
+        nf = out_offsets[blk + 1] - f0
+        res = work[2, :nf]
+        contract(coeffs[offsets[blk]:offsets[blk + 1]], shapes[blk], ts, scratch[d:], work[0], work[1],
+                 res)
+        for i in range(nf):
+            out[out_index[f0 + i]] = res[i]
+    return status
+
+
+@njit(cache=True)
+def value_and_grad_blocks_point(coeffs, offsets, shapes, out_index, out_offsets, bounds, xs, tol,
+                                scratch, work, out):
+    """
+    Evaluate a blocked table and its gradient at one point.
+
+    Each block goes through :func:`value_and_grad_point`, into rows
+    2 (d + 1), ..., 3 (d + 1) - 1 of ``work``; outputs in no block get zero
+    values and gradients.
+
+    Parameters
+    ----------
+    coeffs, offsets, shapes, out_index, out_offsets, bounds, xs, tol
+        As for :func:`evaluate_blocks_point`.
+    scratch : 1D float64 array
+        Length >= d + 2 * max k over the blocks.
+    work : 2D array, shape (>= 3 * (d + 1), >= max over blocks of k_2 * ... * k_d * F_b)
+    out : 2D array, shape (d + 1, F)
+        Values in row 0, the derivative along axis i in row i + 1.
+
+    Returns
+    -------
+    int
+        Status bitmask, as for :func:`evaluate_point`.
+    """
+    d = shapes.shape[1]
+    status = _map_to_box(bounds, xs, tol, scratch[:d])
+    for r in range(d + 1):
+        for f in range(out.shape[1]):
+            out[r, f] = 0.0
+    rows = 2 * (d + 1)
+    for blk in range(offsets.shape[0] - 1):
+        f0 = out_offsets[blk]
+        nf = out_offsets[blk + 1] - f0
+        res = work[rows:rows + d + 1, :nf]
+        value_and_grad_point(coeffs[offsets[blk]:offsets[blk + 1]], shapes[blk], bounds, xs, tol,
+                             scratch, work, res)
+        for r in range(d + 1):
+            for i in range(nf):
+                out[r, out_index[f0 + i]] = res[r, i]
+    return status
+
+
 # ---------------------------------------------------------------- public API
 
 
@@ -446,3 +542,223 @@ def eval_grad_into(coeffs, shape, bounds, tol, x, scratch, work, out):
         raise ValueError("out must have shape (d + 1, F)")
     _check_call(coeffs, shape, x, scratch, work, out.shape[1], True)
     return value_and_grad_point(coeffs, shape, bounds, x, tol, scratch, work, out)
+
+
+class RawBlockedTable(NamedTuple):
+    """
+    A blocked table as plain arrays, for compiled code.
+
+    Returned by :meth:`ChebyshevInterpolantND.raw` for a table stored in
+    blocks (after ``optimize(per_output=True)``), or for any table with
+    ``raw(blocked=True)``. Its fields are the first eight arguments of
+    :func:`eval_blocked_into` and :func:`eval_grad_blocked_into`, in order,
+    so from Python ``eval_blocked_into(*table, x, *ws, out)`` works. As for
+    :class:`RawTable`, pass the fields to your own ``@njit`` functions as
+    separate arguments, not the tuple.
+
+    The arrays are read-only views, taken at the time of the call.
+
+    Attributes
+    ----------
+    coeffs : np.ndarray
+        Every block's coefficients, flattened (C order) and concatenated;
+        float64 or complex128.
+    offsets : np.ndarray
+        int64, length n_blocks + 1: block b is
+        ``coeffs[offsets[b]:offsets[b + 1]]``.
+    shapes : np.ndarray
+        int64, shape (n_blocks, d): the (k_1, ..., k_d) of each block.
+    out_index : np.ndarray
+        int64: the output index of each column of each block, concatenated.
+    out_offsets : np.ndarray
+        int64, length n_blocks + 1: block b's outputs are
+        ``out_index[out_offsets[b]:out_offsets[b + 1]]``.
+    n_outputs : int
+        The number of outputs F. Outputs in no block evaluate to zero.
+    bounds : np.ndarray
+        Shape (2, d): lower bounds in row 0, upper bounds in row 1.
+    tol : float
+        Allowed overshoot outside the domain, as a fraction of each axis's
+        half-width.
+    """
+
+    coeffs: np.ndarray
+    offsets: np.ndarray
+    shapes: np.ndarray
+    out_index: np.ndarray
+    out_offsets: np.ndarray
+    n_outputs: int
+    bounds: np.ndarray
+    tol: float
+
+    @property
+    def ndim(self):
+        """Number of axes d."""
+        return int(self.shapes.shape[1])
+
+    @property
+    def n_blocks(self):
+        """Number of blocks."""
+        return int(self.offsets.shape[0] - 1)
+
+    @property
+    def dtype(self):
+        """Coefficient dtype, and the dtype of the ``out`` arrays."""
+        return self.coeffs.dtype
+
+    def workspace(self):
+        """
+        Allocate scratch space for evaluating this table.
+
+        One workspace serves both :func:`eval_blocked_into` and
+        :func:`eval_grad_blocked_into`. Each thread evaluating at the same
+        time needs its own.
+
+        Returns
+        -------
+        Workspace
+        """
+        m, rest = blocked_sizes(self.shapes, self.out_offsets)
+        d = self.ndim
+        return Workspace(np.empty(d + 2 * m), np.empty((3 * (d + 1), rest), dtype=self.coeffs.dtype))
+
+
+def blocked_sizes(shapes, out_offsets):
+    """The largest k over the blocks, and the largest k_2 * ... * k_d * F_b (at least 1 each)."""
+    if shapes.shape[0] == 0:
+        return 1, 1
+    nf = np.diff(out_offsets)
+    rest = np.prod(shapes[:, 1:], axis=1) * nf
+    return max(1, int(shapes.max())), max(1, int(rest.max()))
+
+
+@njit(cache=True)
+def _blocked_layout(coeffs, offsets, shapes, out_index, out_offsets, n_outputs):
+    """
+    Check that the arrays describe a consistent blocked table; return the
+    largest k over the blocks and the largest k_2 * ... * k_d * F_b.
+    """
+    n_blocks = offsets.shape[0] - 1
+    d = shapes.shape[1]
+    if (n_blocks < 0 or shapes.shape[0] != n_blocks or out_offsets.shape[0] != n_blocks + 1
+            or offsets[n_blocks] != coeffs.shape[0] or out_offsets[n_blocks] != out_index.shape[0]):
+        raise ValueError("inconsistent blocked table; pass the fields of table.raw() unchanged")
+    m = 1
+    rest = 1
+    for blk in range(n_blocks):
+        size = 1
+        for i in range(d):
+            m = max(m, shapes[blk, i])
+            size *= shapes[blk, i]
+        nf = out_offsets[blk + 1] - out_offsets[blk]
+        if size < 1 or nf < 1 or size * nf != offsets[blk + 1] - offsets[blk]:
+            raise ValueError("inconsistent blocked table; pass the fields of table.raw() unchanged")
+        rest = max(rest, size // shapes[blk, 0] * nf)
+    for i in range(out_index.shape[0]):
+        if out_index[i] < 0 or out_index[i] >= n_outputs:
+            raise ValueError("inconsistent blocked table; pass the fields of table.raw() unchanged")
+    return m, rest
+
+
+@njit(cache=True)
+def _check_blocked_call(coeffs, offsets, shapes, out_index, out_offsets, n_outputs, x, scratch, work,
+                        rows, gradient):
+    """Raise if the arrays passed to the blocked entry points do not fit the table."""
+    d = shapes.shape[1]
+    if x.shape[0] != d:
+        raise ValueError("x must have one coordinate per axis of the table")
+    if rows != n_outputs:
+        raise ValueError("out does not have one entry per output of the table")
+    m, rest = _blocked_layout(coeffs, offsets, shapes, out_index, out_offsets, n_outputs)
+    need_rows = 3 * (d + 1) if gradient else 3
+    need_scratch = d + 2 * m if gradient else d + m
+    if scratch.shape[0] < need_scratch or work.shape[0] < need_rows or work.shape[1] < rest:
+        raise ValueError("workspace too small for this table; make it with table.workspace()")
+
+
+@njit(cache=True)
+def eval_blocked_into(coeffs, offsets, shapes, out_index, out_offsets, n_outputs, bounds, tol, x,
+                      scratch, work, out):
+    """
+    Evaluate a raw blocked table at one point, writing the outputs into ``out``.
+
+    The blocked counterpart of :func:`eval_into`, for tables stored in
+    blocks after ``optimize(per_output=True)``. Callable from the user's own
+    ``@njit`` code; it allocates nothing. For example::
+
+        table = interp.precontract({"nu": 0.2}).raw(blocked=True)
+        ws = table.workspace()
+        out = np.empty(table.n_outputs, dtype=table.dtype)
+
+        @njit
+        def rhs(t, y, coeffs, offsets, shapes, out_index, out_offsets, n_outputs,
+                bounds, tol, scratch, work, out):
+            status = eval_blocked_into(coeffs, offsets, shapes, out_index, out_offsets,
+                                       n_outputs, bounds, tol, y, scratch, work, out)
+            ...
+
+        solve_ivp(lambda t, y: rhs(t, y, *table, *ws, out), ...)
+
+    ``raw(blocked=True)`` gives this form for every table, dense or not, so
+    one right-hand side serves both.
+
+    Parameters
+    ----------
+    coeffs, offsets, shapes, out_index, out_offsets, n_outputs, bounds, tol
+        The fields of a :class:`RawBlockedTable`.
+    x : 1D float64 array
+        The point, one coordinate per axis, in the domain's units.
+    scratch, work
+        The fields of a :class:`Workspace`, from ``table.workspace()``.
+    out : 1D array, shape (F,)
+        Receives the outputs; zero for outputs stored in no block.
+
+    Returns
+    -------
+    int
+        Status bitmask, as for :func:`eval_into`.
+
+    Raises
+    ------
+    ValueError
+        If the table's arrays are inconsistent, or ``x``, the workspace or
+        ``out`` does not have the right size for the table.
+    """
+    _check_blocked_call(coeffs, offsets, shapes, out_index, out_offsets, n_outputs, x, scratch, work,
+                        out.shape[0], False)
+    return evaluate_blocks_point(coeffs, offsets, shapes, out_index, out_offsets, bounds, x, tol,
+                                 scratch, work, out)
+
+
+@njit(cache=True)
+def eval_grad_blocked_into(coeffs, offsets, shapes, out_index, out_offsets, n_outputs, bounds, tol, x,
+                           scratch, work, out):
+    """
+    Evaluate a raw blocked table and its gradient at one point, into ``out``.
+
+    The blocked counterpart of :func:`eval_grad_into`.
+
+    Parameters
+    ----------
+    coeffs, offsets, shapes, out_index, out_offsets, n_outputs, bounds, tol, x, scratch, work
+        As for :func:`eval_blocked_into`.
+    out : 2D array, shape (d + 1, F)
+        Row 0 receives the outputs, row i + 1 their derivatives with respect
+        to coordinate i; zero for outputs stored in no block.
+
+    Returns
+    -------
+    int
+        Status bitmask, as for :func:`eval_into`.
+
+    Raises
+    ------
+    ValueError
+        As for :func:`eval_blocked_into`.
+    """
+    if out.shape[0] != shapes.shape[1] + 1:
+        raise ValueError("out must have shape (d + 1, F)")
+    _check_blocked_call(coeffs, offsets, shapes, out_index, out_offsets, n_outputs, x, scratch, work,
+                        out.shape[1], True)
+    return value_and_grad_blocks_point(coeffs, offsets, shapes, out_index, out_offsets, bounds, x, tol,
+                                       scratch, work, out)

@@ -2,8 +2,9 @@
 
 {func}`chebyshevnd.save` writes tables and grids to HDF5 files that
 {func}`chebyshevnd.load` reads back bit for bit. This page documents the
-layout (format version 1), so that other programs can read the tables
-without ChebyshevND, for example with plain `h5py` or the HDF5 C library.
+layout (format versions 1 and 2), so that other programs can read the
+tables without ChebyshevND, for example with plain `h5py` or the HDF5 C
+library.
 
 Saving and loading need `h5py`: `pip install chebyshevnd[io]`.
 
@@ -36,7 +37,7 @@ passed to `save`) has these attributes:
 | Attribute | Type | Meaning |
 |---|---|---|
 | `format` | string | always `"chebyshevnd"` |
-| `format_version` | integer | `1`. Readers should refuse other versions |
+| `format_version` | integer | `2` if the object holds a table stored in blocks (see "Blocked tables" below), otherwise `1`. Readers should refuse versions they do not know |
 | `kind` | string | `"ChebyshevInterpolantND"`, `"MappedInterpolant"` or `"ChebyshevGrid"` |
 | `chebyshevnd_version` | string | version of the package that wrote the file |
 | `created` | string | UTC time of writing, ISO 8601 |
@@ -56,11 +57,12 @@ where T_k is the Chebyshev polynomial of the first kind, the sum runs over
 
 | Name | Kind | Shape, type | Meaning |
 |---|---|---|---|
-| `coeffs` | dataset | (K₁, …, K_d, F), float64 or complex128 (float32 / complex64 if saved with `float32=True`) | the coefficients c, C order. The output axis is always present, even for a single function (F = 1) |
+| `coeffs` | dataset | (K₁, …, K_d, F), float64 or complex128 (float32 / complex64 if saved with `float32=True`) | the coefficients c, C order. The output axis is always present, even for a single function (F = 1). Absent for a blocked table, which has `blocks` instead |
 | `coeffs_full` | dataset, optional | (N₁, …, N_d, F) | the untruncated tensor, if saved with `full=True` and the table was truncated |
 | `domains` | dataset | (d, 2), float64 | row i is (a_i, b_i) |
 | `error_interpolation` | dataset | (F,), float64 | interpolation error estimate per function |
-| `error_truncation` | dataset | (F,), float64 | bound on the error from truncation (and from single-precision storage) |
+| `error_truncation` | dataset | (F,), float64 | bound on the error from truncation (and from single-precision storage): the sum of the magnitudes of the coefficients removed |
+| `error_truncation_l2` | dataset, optional | (F,), float64 | the root-sum-square of the coefficients removed (and of the single-precision rounding); written for optimized tables. Not a bound: an estimate of the typical error. Zero if absent |
 | `coeff_scale` | dataset | (F,), float64 | largest coefficient magnitude per function |
 | `axis_names` | attribute | d strings | variable names, in axis order |
 | `output_names` | attribute | F strings, or none | function names; empty for a single unnamed function |
@@ -70,9 +72,41 @@ where T_k is the Chebyshev polynomial of the first kind, the sum runs over
 | `dtype` | attribute | string | `"float64"` or `"complex128"`: the type to use in memory |
 | `storage_dtype` | attribute | string | the type of `coeffs` in the file |
 | `full_is_coeffs` | attribute | boolean | true if `coeffs` is the untruncated tensor (the table was never optimized) |
+| `rel_tol`, `norm`, `per_output` | attributes, optional | float, string, boolean | the arguments of the `optimize` call that truncated the table, for the record. Not needed to read it |
+| `max_blocks` | attribute, optional | integer | likewise, if it was given |
+| `groups` | attribute, optional | F strings | likewise: the group label of each function, if groups were given |
 
 The absolute error estimate is `error_interpolation + error_truncation`,
 and the relative one divides it by `coeff_scale`.
+
+Version 1 readers ignore the optional entries, so a dense table that
+carries them is still a version 1 file.
+
+## Blocked tables (version 2)
+
+After `optimize(per_output=True)`, each function keeps its own number of
+coefficients per axis, and the functions are stored in dense *blocks*:
+block b holds F_b of them in a tensor of shape (K^b₁, …, K^b_d, F_b). A
+function in no block is identically zero (its whole series fitted in the
+truncation budget). Such a table replaces `coeffs` with:
+
+| Name | Kind | Shape, type | Meaning |
+|---|---|---|---|
+| `layout` | attribute | string | `"blocked"` |
+| `n_blocks` | attribute | integer | the number of blocks B (may be 0) |
+| `blocks/<b>/coeffs` | dataset | (K^b₁, …, K^b_d, F_b), as `coeffs` above | block b's coefficients, C order, for b = 0, …, B − 1 |
+| `blocks/<b>/outputs` | dataset | (F_b,), int64 | the function index (position in `output_names`) of each column of the block; each function is in at most one block |
+
+Function j = `outputs[i]` of block b is
+
+f_j(x) = Σ c_b[k₁, …, k_d, i] T_{k₁}(t₁) ⋯ T_{k_d}(t_d), with 0 ≤ k_m < K^b_m,
+
+and a function listed in no block is zero. Every other entry of the table
+group (`coeffs_full`, the error estimates, the attributes) is as above,
+with `full_is_coeffs` false. `float32=True` applies to every block.
+
+A blocked table can also be the `table` of a mapped table (below), which
+makes the whole file version 2. Boundary tables are always dense.
 
 ## Mapped tables (`kind = "MappedInterpolant"`)
 
@@ -119,3 +153,11 @@ The format version changes whenever a reader of the old version would
 misread a new file. A reader should refuse versions it does not know;
 {func}`chebyshevnd.load` does, and its error names the version that wrote
 the file.
+
+| Version | Written by | Change |
+|---|---|---|
+| 1 | 0.2.0 and later, for objects without blocked tables | the first version |
+| 2 | 0.2.0 and later, for objects holding a blocked table | blocked tables (`layout`, `blocks`) |
+
+Files are written with the oldest version that can hold them, so readers
+of version 1 keep reading every file without blocked tables.
