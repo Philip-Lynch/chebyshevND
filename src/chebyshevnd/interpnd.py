@@ -730,7 +730,7 @@ class ChebyshevInterpolantND:
                 table = xp.asarray(self._coeffs)
             else:
                 table = BlockedCoeffs([c for c, _ in self._blocks], [o for _, o in self._blocks],
-                                      self._n_out, self._dtype, box=self._kmax).to(xp)
+                                      self._n_out, self._dtype, box=self._kmax, xp=np).to(xp)
             self._device_tables[key] = (table, xp.asarray(self._a), xp.asarray(self._b))
         return self._device_tables[key]
 

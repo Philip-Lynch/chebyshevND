@@ -625,12 +625,11 @@ class RawBlockedTable(NamedTuple):
 
 def blocked_sizes(shapes, out_offsets):
     """The largest k over the blocks, and the largest k_2 * ... * k_d * F_b (at least 1 each)."""
-    m, rest = 1, 1
-    for b in range(shapes.shape[0]):
-        nf = int(out_offsets[b + 1] - out_offsets[b])
-        m = max(m, int(shapes[b].max()))
-        rest = max(rest, int(np.prod(shapes[b, 1:])) * nf)
-    return m, rest
+    if shapes.shape[0] == 0:
+        return 1, 1
+    nf = np.diff(out_offsets)
+    rest = np.prod(shapes[:, 1:], axis=1) * nf
+    return max(1, int(shapes.max())), max(1, int(rest.max()))
 
 
 @njit(cache=True)

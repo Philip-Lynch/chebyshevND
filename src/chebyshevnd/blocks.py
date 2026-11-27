@@ -38,13 +38,14 @@ class BlockedCoeffs:
     dtype : dtype
         The coefficient dtype (needed when there are no blocks).
     box : tuple of int, optional
-        The elementwise largest block shape (K_1, ..., K_d), needed only when
-        there are no blocks.
+        The elementwise largest block shape (K_1, ..., K_d). Computed from
+        the blocks if not given; needed when there are none.
     members : int, optional
         The number of batch members for per-member blocks; None for shared
         blocks.
     xp : module, optional
-        The array module, needed only when there are no blocks.
+        The array module. Found from the blocks if not given; needed when
+        there are none.
     """
 
     def __init__(self, blocks, outputs, n_outputs, dtype, box=None, members=None, xp=None):
@@ -52,10 +53,12 @@ class BlockedCoeffs:
         self.outputs = tuple(outputs)
         self.n_outputs = int(n_outputs)
         self.members = None if members is None else int(members)
-        self.xp = array_namespace(*self.blocks) if self.blocks else (xp or np)
+        if xp is None:
+            xp = array_namespace(*self.blocks) if self.blocks else np
+        self.xp = xp
         self.dtype = np.dtype(dtype)
         lead = 0 if self.members is None else 1
-        if self.blocks:
+        if box is None:
             d = self.blocks[0].ndim - 1 - lead
             box = tuple(max(int(c.shape[lead + i]) for c in self.blocks) for i in range(d))
         self.box = tuple(int(k) for k in box)
