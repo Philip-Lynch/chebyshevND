@@ -1,8 +1,9 @@
 # ChebyshevND — design document for the NIT / SEOBNRv6EPHM extension
 
-**Revision:** 3.7 (2026-11-10).
-- Steps 1–6 and 8 are implemented; §3 records what was built and where it
-  differs from the plan.
+**Revision:** 3.8 (2026-11-27).
+- Steps 1–6, 8 and 9 are implemented; §3 records what was built and where
+  it differs from the plan. Step 9 (per-output truncation, blocked storage)
+  came from the first real NIT tables.
 - Step 7 is deferred (D7): the NIT now uses an (α, β) equinoctial
   parametrisation, which removes the `1/e` behaviour of `f_w`.
 - GPU support with CUDA via CuPy is now a requirement (§0.3, A8, D6).
@@ -11,7 +12,7 @@
 - Step 0 is complete (v0.1.1).
 - §9 lists all revisions and maps the old step numbers to the new ones.
 
-**Branch:** `dev` (v0.1.1 plus Steps 1–6 and 8; version 0.2.0).
+**Branch:** `dev` (v0.1.1 plus Steps 1–6, 8 and 9; version 0.2.0).
 
 **Purpose:** turn ChebyshevND from a 1D–4D single-function interpolator into the
 tabulation-and-evaluation backend for:
@@ -1126,7 +1127,7 @@ the mode amplitudes), the design below still applies.
   The staircase question is moot.
 - **No per-function-group pruning.** There is no real multi-output table
   yet to show that the union `kmax` is wasteful; revisit with the first NIT
-  tables.
+  tables. (Revisited in Step 9: it was.)
 - **Resolution diagnostics:** `error_by_axis(relative=False)` gives the
   trailing-coefficient estimate per axis and function, to set node counts
   per axis.
@@ -1155,11 +1156,149 @@ the mode amplitudes), the design below still applies.
 
 ---
 
+### Step 9 — Per-output truncation and blocked storage — IMPLEMENTED
+
+**Why.** The first NIT tables of `pyseobnr_nits` are multi-output
+`MappedInterpolant`s over (ν, p, e²): `fourier0` (16, 40, 20) × 504 outputs,
+52 MB, and `inv` × 608, 62 MB. Their outputs are the Fourier harmonics of
+four families each (e.g. `Fp_0 … Fp_100`). Each waveform calls
+`precontract({"nu": ν})` once, which is memory-bound and sets the
+per-waveform floor; with two spin axes, dense tensors would grow ~100×.
+High harmonics are tiny next to their family's low ones, so their
+coefficients are interpolation noise. But `optimize()` removed nothing
+from either table:
+- it measures each output against its *own* largest coefficient, so a
+  negligible harmonic's noise looks O(1);
+- it shares one `kmax` box between all outputs, so the most demanding
+  output sets it.
+
+The change request (`pyseobnr_nits/notes/chebnd_per_output_truncation.md`,
+2026-11-26) asked for group tolerances, an RMS norm, per-output truncation
+and blocked storage, with every default unchanged.
+
+**As built** (2026-11-27, branch `per-output-truncation`):
+- **`optimize(rel_tol, keep_full, *, groups=None, norm="l1",
+  per_output=False, max_blocks=None)`.** With the defaults it computes
+  exactly what it did before (checked against the old code and against a
+  file written by it).
+  - `groups` (F labels, or label → names or indices) makes each output's
+    budget `rel_tol · S_g`, with S_g its group's largest coefficient.
+  - `norm="l2"` budgets √(Σ removed²): the greedy pruner on |c|² with
+    `delta = rel_tol²`.
+  - `per_output=True` prunes every output on its own. An output whose
+    whole series fits its budget is stored in no block and evaluates to
+    exactly 0, as do its derivatives.
+  - `max_blocks` (with `per_output`) groups the outputs into at most that
+    many dense blocks. Outputs are sorted by box volume, and the sorted
+    list is split into contiguous runs minimising Σ_b F_b Π K^b, by an exact
+    dynamic programme over runs (O(F² B) array operations, < 10 ms for
+    F = 600). `None` gives one block per output.
+  - `MappedInterpolant.optimize` passes the same arguments to its table.
+- **Storage: every table is a tuple of `(coeffs, outputs)` blocks.**
+  - A dense table is one block holding every output in order. It keeps the
+    old fields and kernels, so results are bit for bit and per-call
+    overhead is unchanged (checked with an interleaved benchmark against
+    `dev`).
+  - A blocked table stores its blocks as views into one flat array, the
+    layout of the blocked Numba kernels.
+  - A block keeps the real coefficients over its whole box, including
+    those beyond a member's own pruned box. That is more accurate than
+    zeroing them, and the error figures are computed from what is stored.
+- **Every method works on blocked tables:**
+  - Numba point evaluation: new kernels loop over the blocks with the
+    existing `contract` / `value_and_grad_point` and scatter the outputs;
+  - batched NumPy/CuPy: bases once per chunk, then one GEMM and a scatter
+    per block;
+  - `precontract` / `precontract_batch`: the status and bases once, one GEMM
+    per block, and the results keep their blocks;
+  - `ChebyshevBatch`, `MappedBatch`, `derivative`, `error_by_axis`,
+    `to_device`, `value_grad_hess_batch`.
+
+  `get_coefficients()` returns the zero-filled dense tensor, `kmax` is the
+  elementwise maximum, and the new properties are `blocks`, `output_kmax`
+  and `discarded_l2`.
+- **Numba entry points.** `raw()` gives a `RawBlockedTable` (flat
+  coefficients, `offsets`, `shapes`, `out_index`, `out_offsets`,
+  `n_outputs`, bounds, tol) for blocked tables, used with
+  `eval_blocked_into` / `eval_grad_blocked_into`. The mapped versions are
+  `RawMappedBlockedTable` with `eval_physical_blocked_into` /
+  `eval_grad_physical_blocked_into`; `MappedInterpolant.evaluate` needs
+  them. `raw(blocked=True)` gives the blocked form for any table, so one
+  RHS serves both layouts. The workspace is the same `Workspace`, with
+  3 (d + 1) work rows.
+- **Error bookkeeping.**
+  - `absolute_error()` stays the rigorous L1 bound (interpolation estimate
+    + Σ|removed|, computed as total − kept, as before).
+  - `discarded_l2` is computed directly from the removed coefficients, not
+    as a difference, to avoid cancellation. It is not a bound: at random
+    points the largest error came to ≤ 3.7 × `rel_tol` × S_g on the NIT
+    tables.
+  - Precontraction inherits both. A derivative computes them exactly when
+    the full tensor is held, and otherwise scales them by the Markov
+    factor.
+- **Found on the way:**
+  - `derivative()` without the full tensor used k_i instead of N_i in its
+    Markov factor. The discarded coefficients reach degree N_i − 1, so the
+    bound could be far too small (1e-6 reported against 8.1e-5 for
+    1 + 1e-6 T₉). Fixed.
+  - Every precontraction also paid for a pass over its result to compute
+    the coefficient scale, which only error estimates use. It is now
+    computed on first use, which takes the dense `fourier0` precontraction
+    from 1.35 to 0.93 ms.
+  - `MappedInterpolant`'s cached arrays went stale if `m.table` was
+    optimized after wrapping. They now follow the table.
+- **Boundary tables must stay dense** (`NotImplementedError` otherwise).
+  They are tiny, and the mapped kernels take one dense boundary.
+- **File format version 2** (`docs/file_format.md`): `blocks/<b>/coeffs` and
+  `blocks/<b>/outputs`, written only for objects holding a blocked table.
+  Everything else stays version 1, and `load` reads both. Optimized tables
+  also record `rel_tol`, `norm`, `per_output`, `max_blocks`, the group
+  labels and `error_truncation_l2`. These are optional, and version 1
+  readers ignore them.
+- **Measured** (`benchmarks/bench_blocked.py`, Apple M-series, `rel_tol =
+  1e-9`, `norm="l2"`, `per_output=True`). `precontract` is the best of 100
+  calls, and its cold time the median after flushing the caches;
+  `evaluate` is on the precontracted table.
+
+  | table, blocks | stored | empty outputs | `precontract` ms (cold) | `evaluate` µs | max error / S_g |
+  |---|---|---|---|---|---|
+  | fourier0, dense | 52 MB | – | 0.94 (1.8) | 214 | – |
+  | fourier0, 4 | 32% | 42% | 0.48 (1.1) | 90 | 2.3e-9 |
+  | fourier0, 8 | 28% | 42% | 0.58 (1.6) | 87 | 2.3e-9 |
+  | fourier0, 16 | 25% | 42% | 0.67 (3.0) | 82 | 2.6e-9 |
+  | fourier0, 292 (one per output) | 17% | 42% | 2.3 (2.5) | 130 | 3.4e-9 |
+  | inv, dense | 62 MB | – | 1.09 (2.7) | 261 | – |
+  | inv, 4 | 31% | 59% | 0.52 (1.4) | 98 | 1.6e-9 |
+  | inv, 8 | 29% | 59% | 0.49 (1.4) | 95 | 1.9e-9 |
+  | inv, 16 | 26% | 59% | 0.61 (2.3) | 92 | 2.3e-9 |
+  | inv, 249 (one per output) | 21% | 59% | 2.2 (2.4) | 146 | 3.7e-9 |
+
+  - The stored fractions are those the change request predicted.
+  - With 4–8 blocks, `precontract` is ~2× faster than dense, against the
+    3–5× hoped for. Its GEMMs scale with the stored bytes, but ~0.25 ms of
+    fixed cost remains: first-touch page faults on the new child, the
+    mapped wrapper, and the status checks.
+  - One block per output is *slower* than dense, at ~7 µs of Python per
+    block. Use `max_blocks` 4–8, which is also the most compact choice
+    that stays fast.
+  - Single-point `evaluate` is 2.3–2.8× faster.
+  - `evaluate_batch` at 200 points is roughly unchanged, because many
+    small GEMMs are less efficient than one large one.
+  - Cold timings vary more from run to run.
+- **Open:**
+  - A Numba precontraction for a single member would remove the per-block
+    Python cost and make ragged storage pay off.
+  - Sparse or staircase layouts stay out of scope; they may matter for the
+    5D spin tables.
+  - The GPU test `test_gpu_blocked_tables` has not been run.
+
+---
+
 ## 4. How the steps map to the project milestones
 
 | Milestone | Steps required |
 |---|---|
-| Nonspinning v6EHM NIT (3D grid, 0/1/2PA, handover) | 0–6 (done). Step 7 is not needed: the (α, β) parametrisation removes the `1/e` (D7) |
+| Nonspinning v6EHM NIT (3D grid, 0/1/2PA, handover) | 0–6 (done), and 9 (done) for the many-harmonic tables. Step 7 is not needed: the (α, β) parametrisation removes the `1/e` (D7) |
 | Aligned-spin v6EHM NIT (5D grid) | Step 5 checkpointing becomes essential (grid builds get expensive); cheap spin axes via per-axis N |
 | Precessing v6EPHM NIT (5D grid + moment tables `g_n`, derivative tables for in-plane scalars) | All steps. Step 2 must support precontracting only `ν` while the spin-projection axes stay live; that live 4D table is the main performance risk (§0.1) |
 | Multivoice waveform interpolation (mode amplitudes) | Steps 1, 2, 6 (float32), 8 (the amplitude grid is coarser and separate from the dynamics grid) |
@@ -1242,10 +1381,20 @@ These change details of 1e, 2b and 4b, not the plan's structure.
 | 6 (done) | new `io.py` (`save`, `load`, `read_metadata`), `interpnd.py` and `mapped.py` (`to_device`), `backend.py` (`resolve_device`), `pyproject.toml` (`io` extra), CI (installs it), new `docs/file_format.md`, `docs/api.rst`, `docs/index.md`; tests `test_io.py` |
 | 7 (deferred) | — |
 | 8 (done) | `interpnd.py` (`error_by_axis`), new `examples/example_nd_workflow.ipynb`, README, `docs/index.md`, `pyproject.toml` and `CITATION.cff` (0.2.0); tests in `test_interpnd.py` |
+| 9 (done) | new `blocks.py` (`BlockedCoeffs`, packing, partition, groups); `interpnd.py` (blocks, `optimize` arguments, `blocks`, `output_kmax`, `discarded_l2`, `raw(blocked=)`, lazy scale, Markov fix); `kernels.py` (blocked kernels, `RawBlockedTable`, `eval_blocked_into`, `eval_grad_blocked_into`); `batched.py` (blocked batches, `precontract_blocks`); `batch.py`; `maps.py` (`RawMappedBlockedTable`, mapped blocked entry points); `mapped.py` (`optimize`, blocked tables, caches); `io.py` and `docs/file_format.md` (version 2); `docs/api.rst`, README; new `benchmarks/bench_blocked.py`; new tests `test_blocked.py`, fixture `tests/data/`, additions to `test_io.py` and `test_derivatives.py` |
 
 ---
 
 ## 9. Revision history
+
+**Revision 3.8 (2026-11-27).** Step 9 implemented (branch
+`per-output-truncation`), from the change request of `pyseobnr_nits`:
+- per-output truncation against group tolerances, with an L2 option;
+- blocked storage, including the Numba entry points and file format
+  version 2;
+- the derivative Markov-bound fix;
+- a lazily computed coefficient scale, which makes precontraction cheaper;
+- the measurements on the NIT tables.
 
 **Revision 3.7 (2026-11-10).** Step 7 deferred (D7) and Step 8 implemented
 (branch `step8-consolidation`):

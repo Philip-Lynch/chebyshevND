@@ -27,7 +27,10 @@ error estimates that come free from the coefficient decay.
 - A-posteriori error estimates from trailing coefficient magnitudes, per
   function and per axis
 - Structured pruning (`optimize`) that trims insignificant trailing
-  coefficient slices under a global error budget
+  coefficient slices under a global error budget, or, for tables of many
+  functions of very different sizes (e.g. Fourier harmonics), function by
+  function against the scale of each function's family, with the result
+  stored in a few dense blocks
 - **Precontraction**: fix some variables (e.g. the parameters of one
   waveform) once, for much cheaper evaluations over the rest, also for a whole
   batch of parameter values at once
@@ -195,9 +198,14 @@ mistake does.
    along every axis, so most of the tensor is numerically irrelevant.
    `optimize` greedily discards trailing slices while keeping the summed
    discarded magnitude — an upper bound on the introduced uniform error —
-   under a relative tolerance you choose. Trailing coefficient magnitudes also
-   provide error estimates (`absolute_error`, `relative_error`) without any
-   extra function samples.
+   under a relative tolerance you choose. With `per_output=True` each function
+   is truncated on its own, against the largest coefficient of its `groups`
+   (e.g. its family of harmonics), optionally with a root-sum-square budget
+   (`norm="l2"`) that suits a tail of interpolation noise; functions with
+   similar truncations are then stored together in at most `max_blocks` dense
+   blocks, and negligible functions store nothing. Trailing coefficient
+   magnitudes also provide error estimates (`absolute_error`,
+   `relative_error`) without any extra function samples.
 
 ## Roadmap
 
