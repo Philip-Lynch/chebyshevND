@@ -22,6 +22,7 @@ from chebyshevnd import (  # noqa: E402
 from chebyshevnd.backend import array_namespace, to_numpy  # noqa: E402
 from chebyshevnd.io import FORMAT_VERSION  # noqa: E402
 from helpers import sample_on_grid  # noqa: E402
+from test_blocked import blocked_table, mapped_pair, random_points as blocked_points  # noqa: E402
 from test_mapped import DOMAINS, MAPS, SHAPE, F, G, fit_mapped, make_boundary, random_physical  # noqa: E402
 
 BOX = [(0.0, 2.0), (-1.0, 3.0), (1.0, 4.0)]
@@ -221,7 +222,8 @@ def test_metadata_round_trip(tmp_path):
     assert read["outputs"] == ["dudchi", "dedchi"]
     np.testing.assert_array_equal(read["spins"], meta["spins"])
     assert read["source"] == {"hash": "abc123", "lines": 4200}
-    assert read["kind"] == "ChebyshevInterpolantND" and read["format_version"] == FORMAT_VERSION
+    # Dense tables keep format version 1 (only blocked tables need 2)
+    assert read["kind"] == "ChebyshevInterpolantND" and read["format_version"] == 1
     assert "created" in read and "chebyshevnd_version" in read
     interp, read2 = load(tmp_path / "t.h5", return_metadata=True)
     assert read2["model"] == "SEOBNRv6EHM"
@@ -256,7 +258,7 @@ def test_errors(tmp_path):
         save(tmp_path / "x.h5", np.zeros(3))
     with h5py.File(path, "a") as f:
         f.attrs["format_version"] = FORMAT_VERSION + 1
-    with pytest.raises(ValueError, match=r"newer file format version 2.*Upgrade"):
+    with pytest.raises(ValueError, match=rf"newer file format version {FORMAT_VERSION + 1}.*Upgrade"):
         load(path)
     with h5py.File(tmp_path / "other.h5", "w") as f:
         f.create_dataset("x", data=np.zeros(3))
@@ -322,6 +324,136 @@ def test_version_1_files_load_bit_for_bit(name):
             np.testing.assert_allclose(new, r[old], rtol=1e-14, atol=1e-15)
     # BLAS results may differ in the last bits between libraries and sizes
     np.testing.assert_allclose(batch, r["batch"], rtol=1e-13, atol=1e-15)
+
+
+# ------------------------------------------------- blocked tables (version 2)
+
+
+def assert_same_blocked(a, b):
+    """Two blocked tables are the same, bit for bit."""
+    assert a.kmax == b.kmax and a.n_outputs == b.n_outputs and a.dtype == b.dtype
+    assert len(a.blocks) == len(b.blocks)
+    for (oa, ca), (ob, cb) in zip(a.blocks, b.blocks):
+        np.testing.assert_array_equal(oa, ob)
+        np.testing.assert_array_equal(ca, cb)
+    np.testing.assert_array_equal(a.output_kmax, b.output_kmax)
+    for attr in ("absolute_error", "relative_error"):
+        np.testing.assert_array_equal(getattr(a, attr)(), getattr(b, attr)())
+    np.testing.assert_array_equal(a.discarded_l2, b.discarded_l2)
+    assert a._truncation == b._truncation
+    pts = blocked_points(a, 20)
+    np.testing.assert_array_equal(a.evaluate_batch(pts), b.evaluate_batch(pts))
+    for p in pts[:4]:
+        np.testing.assert_array_equal(a.evaluate(*p), b.evaluate(*p))
+        for x, y in zip(a.value_and_grad(*p), b.value_and_grad(*p)):
+            np.testing.assert_array_equal(x, y)
+    fixed = {a.axis_names[0]: float(pts[0, 0])}
+    np.testing.assert_array_equal(a.precontract(fixed).evaluate_batch(pts[:, 1:]),
+                                  b.precontract(fixed).evaluate_batch(pts[:, 1:]))
+
+
+@pytest.mark.parametrize("dtype", [float, complex])
+@pytest.mark.parametrize("full", [False, True])
+def test_blocked_round_trip_is_bit_exact(tmp_path, dtype, full):
+    table, labels = blocked_table(3, dtype, max_blocks=3, keep_full=True)
+    save(tmp_path / "b.h5", table, full=full)
+    with h5py.File(tmp_path / "b.h5", "r") as f:
+        assert int(f.attrs["format_version"]) == 2
+        assert f.attrs["layout"] == "blocked" and int(f.attrs["n_blocks"]) == len(table.blocks)
+        assert "coeffs" not in f and len(f["blocks"]) == len(table.blocks)
+        assert f.attrs["norm"] == "l2" and bool(f.attrs["per_output"])
+        assert list(f.attrs["groups"].astype(str)) == labels
+        assert ("coeffs_full" in f) == full
+    loaded = load(tmp_path / "b.h5")
+    labels_as_text = dict(table._truncation, groups=tuple(map(str, labels)))
+    assert loaded._truncation == labels_as_text
+    table._truncation = labels_as_text  # group labels are stored as text
+    assert_same_blocked(table, loaded)
+    if full:
+        np.testing.assert_array_equal(loaded.get_coefficients(full=True), table.get_coefficients(full=True))
+        loaded.optimize(1e-6, groups=labels, per_output=True)
+    else:
+        with pytest.raises(RuntimeError):
+            loaded.get_coefficients(full=True)
+
+
+def test_blocked_float32_round_trip(tmp_path):
+    table, _ = blocked_table(3, complex, keep_full=False)
+    save(tmp_path / "b32.h5", table, float32=True)
+    with h5py.File(tmp_path / "b32.h5", "r") as f:
+        assert all(f["blocks"][b]["coeffs"].dtype == np.complex64 for b in f["blocks"])
+    loaded = load(tmp_path / "b32.h5")
+    assert loaded.dtype == np.complex128
+    pts = blocked_points(table, 20)
+    scale = np.abs(table.get_coefficients()).max()
+    np.testing.assert_allclose(loaded.evaluate_batch(pts), table.evaluate_batch(pts), rtol=0, atol=1e-5 * scale)
+    # The rounding is added to both error figures
+    assert np.all(loaded.absolute_error() >= table.absolute_error())
+    assert np.all(loaded.discarded_l2 >= table.discarded_l2)
+    # A second round trip in single precision changes nothing
+    save(tmp_path / "again.h5", loaded, float32=True)
+    again = load(tmp_path / "again.h5")
+    np.testing.assert_array_equal(again.get_coefficients(), loaded.get_coefficients())
+    np.testing.assert_array_equal(again.evaluate_batch(pts), loaded.evaluate_batch(pts))
+
+
+def test_blocked_mapped_round_trip(tmp_path):
+    boundary = make_boundary()
+    m, _ = mapped_pair(complex, boundary)
+    save(tmp_path / "m.h5", m)
+    with h5py.File(tmp_path / "m.h5", "r") as f:
+        assert int(f.attrs["format_version"]) == 2
+        assert "blocks" in f["table"] and "coeffs" in f["boundary"]
+    loaded = load(tmp_path / "m.h5")
+    assert isinstance(loaded, MappedInterpolant) and not loaded.table._dense
+    x = random_physical(15, seed=9, margin=0.01)
+    np.testing.assert_array_equal(loaded.evaluate_batch(x), m.evaluate_batch(x))
+    for p in x[:4]:
+        np.testing.assert_array_equal(loaded.evaluate(*p), m.evaluate(*p))
+    child, want = loaded.precontract({"r": float(x[0, 0]), "e": float(x[0, 2])}), \
+        m.precontract({"r": float(x[0, 0]), "e": float(x[0, 2])})
+    np.testing.assert_array_equal(child.evaluate(x[0, 1], x[0, 3]), want.evaluate(x[0, 1], x[0, 3]))
+
+
+def test_empty_blocked_table_round_trip(tmp_path):
+    table = ChebyshevInterpolantND(np.zeros((5, 4, 3)), [(0, 1), (0, 1)], output_names=["a", "b", "c"])
+    table.optimize(1e-8, per_output=True)
+    save(tmp_path / "e.h5", table)
+    loaded = load(tmp_path / "e.h5")
+    assert loaded.blocks == () and loaded.kmax == (0, 0) and loaded.dtype == np.float64
+    assert np.all(loaded.evaluate(0.5, 0.5) == 0)
+
+
+def test_dense_optimized_tables_stay_version_1(tmp_path):
+    interp = build()
+    interp.optimize(1e-6, groups=["f", "f"], norm="l2")
+    save(tmp_path / "d.h5", interp)
+    with h5py.File(tmp_path / "d.h5", "r") as f:
+        assert int(f.attrs["format_version"]) == 1
+        assert "coeffs" in f and "blocks" not in f and "layout" not in f.attrs
+        # Optional extras, ignored by version 1 readers
+        assert f.attrs["norm"] == "l2" and "error_truncation_l2" in f
+    loaded = load(tmp_path / "d.h5")
+    assert_same_table(interp, loaded)
+    np.testing.assert_array_equal(loaded.discarded_l2, interp.discarded_l2)
+
+
+def test_default_optimize_matches_the_version_1_fixture():
+    """The fixture's optimized table, rebuilt and optimized by this code, matches the old code."""
+    sys.path.insert(0, FIXTURE)
+    try:
+        from make_v1_fixture import make_tables
+    finally:
+        sys.path.remove(FIXTURE)
+    plain = make_tables()[0]  # optimize(1e-6) with the default arguments
+    ref = np.load(os.path.join(FIXTURE, "v1_reference.npz"))
+    assert plain.kmax == tuple(ref["plain/kmax"])
+    if str(ref["platform"]) == f"{sys.platform}-{platform.machine()}":
+        np.testing.assert_array_equal(plain.get_coefficients(), ref["plain/coeffs"])
+        np.testing.assert_array_equal(plain.absolute_error(), ref["plain/abs_error"])
+    else:
+        np.testing.assert_allclose(plain.get_coefficients(), ref["plain/coeffs"], rtol=1e-12, atol=1e-16)
+        np.testing.assert_allclose(plain.absolute_error(), ref["plain/abs_error"], rtol=1e-6)
 
 
 # ------------------------------------------------------------------- GPU

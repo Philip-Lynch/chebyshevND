@@ -20,7 +20,11 @@ import os
 import numpy as np
 
 FORMAT = "chebyshevnd"
-FORMAT_VERSION = 1
+#: The newest format version; files are written with the oldest version that
+#: can hold them: 1 unless a table is stored in blocks, which needs 2
+FORMAT_VERSION = 2
+#: The format versions this package reads
+READ_VERSIONS = (1, 2)
 
 _KINDS = ("ChebyshevInterpolantND", "MappedInterpolant", "ChebyshevGrid")
 #: Written by save() itself and returned by read_metadata()
@@ -67,7 +71,8 @@ def save(target, obj, *, metadata=None, float32=False, full=False, overwrite=Fal
         that need only ~1e-7 relative accuracy (e.g. waveform amplitudes).
         They are converted back to double precision on load, and the
         rounding they lost is added to the stored error estimate. Boundary
-        tables are always stored in double precision.
+        tables are always stored in double precision. For a table stored in
+        blocks, this applies to every block.
     full : bool, optional
         Also store the full (untruncated) coefficient tensor of an optimized
         table, so the loaded table can be optimized again and supports
@@ -77,6 +82,12 @@ def save(target, obj, *, metadata=None, float32=False, full=False, overwrite=Fal
     overwrite : bool, optional
         Replace an existing file, or the contents of a non-empty group.
         Without it, saving over an existing table raises an error.
+
+    Notes
+    -----
+    The file uses format version 1 unless a table is stored in blocks
+    (after ``optimize(per_output=True)``), which needs version 2; see
+    ``docs/file_format.md``.
     """
     h5py = _h5py()
     kind = _kind(obj)
@@ -174,8 +185,10 @@ def _prepare_group(group, overwrite):
 
 
 def _write(group, obj, kind, metadata, float32, full):
+    table = obj if kind == "ChebyshevInterpolantND" else getattr(obj, "table", None)
     group.attrs["format"] = FORMAT
-    group.attrs["format_version"] = FORMAT_VERSION
+    # Boundary tables are always dense; only a blocked table needs version 2
+    group.attrs["format_version"] = 2 if table is not None and not table._dense else 1
     group.attrs["kind"] = kind
     group.attrs["chebyshevnd_version"] = _version()
     group.attrs["created"] = datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")
@@ -216,42 +229,68 @@ def _strings(values):
 
 def _write_table(group, interp, float32, full):
     """Write one ChebyshevInterpolantND (schema: docs/file_format.md)."""
-    coeffs = interp._coeffs
-    complex_table = coeffs.dtype.kind == "c"
-    storage = (np.complex64 if complex_table else np.float32) if float32 else coeffs.dtype
+    dtype = interp.dtype
+    complex_table = dtype.kind == "c"
+    storage = (np.complex64 if complex_table else np.float32) if float32 else dtype
     if full and interp._coeffs_full is None:
         raise ValueError("full=True, but the full coefficient tensor was dropped by "
                          "optimize(keep_full=False).")
-
-    truncation = np.array(interp._discarded, dtype=np.float64)
+    n_out = interp.n_outputs
 
     def stored(array):
         out = np.ascontiguousarray(array, dtype=storage)
         if float32:
             # The rounding to single precision adds at most this much to |error|
-            lost = np.abs(array - out.astype(array.dtype)).reshape(-1, array.shape[-1]).sum(axis=0)
-            return out, lost
-        return out, 0.0
+            diff = np.abs(array - out.astype(array.dtype)).reshape(-1, array.shape[-1])
+            return out, diff.sum(axis=0), (diff ** 2).sum(axis=0)
+        return out, 0.0, 0.0
 
-    data, lost = stored(coeffs)
-    group.create_dataset("coeffs", data=data)
-    # Untruncated, the evaluation tensor is the full tensor: no need to store it twice
-    untruncated = interp._coeffs_full is not None and interp._kmax == interp._grid_shape
+    lost = np.zeros(n_out)
+    lost_sq = np.zeros(n_out)
+    if interp._dense:
+        data, lost[:], lost_sq[:] = stored(interp._coeffs)
+        group.create_dataset("coeffs", data=data)
+        # Untruncated, the evaluation tensor is the full tensor: no need to store it twice
+        untruncated = interp._coeffs_full is not None and interp._untruncated
+    else:
+        # Version 2: one subgroup per block, with its coefficients and outputs
+        blocks = group.create_group("blocks")
+        for b, (coeffs, outputs) in enumerate(interp._blocks):
+            g = blocks.create_group(str(b))
+            data, lost[outputs], lost_sq[outputs] = stored(coeffs)
+            g.create_dataset("coeffs", data=data)
+            g.create_dataset("outputs", data=np.asarray(outputs, dtype=np.int64))
+        group.attrs["layout"] = "blocked"
+        group.attrs["n_blocks"] = len(interp._blocks)
+        untruncated = False
     group.attrs["full_is_coeffs"] = untruncated
     if full and not untruncated:
-        full_data, _ = stored(interp._coeffs_full)
+        full_data, _, _ = stored(interp._coeffs_full)
         group.create_dataset("coeffs_full", data=full_data)
     group.create_dataset("domains", data=np.stack([interp._a, interp._b], axis=1))
     group.create_dataset("error_interpolation", data=np.asarray(interp._interp_error, dtype=np.float64))
-    group.create_dataset("error_truncation", data=truncation + lost)
+    group.create_dataset("error_truncation", data=np.array(interp._discarded, dtype=np.float64) + lost)
     group.create_dataset("coeff_scale", data=np.asarray(interp._scale, dtype=np.float64))
+    if interp._truncation is not None or np.any(interp._discarded_l2) or float32:
+        group.create_dataset("error_truncation_l2",
+                             data=np.sqrt(np.asarray(interp._discarded_l2, dtype=np.float64) ** 2 + lost_sq))
     group.attrs["axis_names"] = _strings(interp.axis_names)
     group.attrs["output_names"] = _strings(interp.output_names)
     group.attrs["grid_shape"] = np.array(interp.grid_shape, dtype=np.int64)
     group.attrs["nodes"] = interp.nodes
     group.attrs["domain_tol"] = float(interp.domain_tol)
-    group.attrs["dtype"] = np.dtype(coeffs.dtype).name
+    group.attrs["dtype"] = np.dtype(dtype).name
     group.attrs["storage_dtype"] = np.dtype(storage).name
+    truncation = interp._truncation
+    if truncation is not None:
+        # How the table was truncated, for the record (not needed to read it)
+        group.attrs["rel_tol"] = truncation["rel_tol"]
+        group.attrs["norm"] = truncation["norm"]
+        group.attrs["per_output"] = truncation["per_output"]
+        if truncation["max_blocks"] is not None:
+            group.attrs["max_blocks"] = truncation["max_blocks"]
+        if truncation["groups"] is not None:
+            group.attrs["groups"] = _strings(str(label) for label in truncation["groups"])
 
 
 def _write_map(group, axis_map):
@@ -302,13 +341,13 @@ def _check_format(group):
         raise ValueError(f"{group.file.filename}:{group.name} is not a ChebyshevND table "
                          f"(no format attribute {FORMAT!r}).")
     version = int(group.attrs.get("format_version", -1))
-    if version != FORMAT_VERSION:
+    if version not in READ_VERSIONS:
         writer = group.attrs.get("chebyshevnd_version", "an unknown version")
         newer = "newer " if version > FORMAT_VERSION else ""
         raise ValueError(
             f"{group.file.filename}:{group.name} uses {newer}file format version {version} "
             f"(written by chebyshevnd {writer}); this chebyshevnd ({_version()}) reads format "
-            f"version {FORMAT_VERSION}."
+            f"versions {', '.join(map(str, READ_VERSIONS))}."
             + (" Upgrade chebyshevnd to read it." if version > FORMAT_VERSION else "")
         )
     kind = group.attrs.get("kind")
@@ -348,13 +387,28 @@ def _read_table(group):
     from .interpnd import ChebyshevInterpolantND
 
     dtype = np.dtype(str(group.attrs["dtype"]))
-    coeffs = np.ascontiguousarray(group["coeffs"][()], dtype=dtype)
+    if "blocks" in group:
+        blocks = group["blocks"]
+        coeffs = [(np.ascontiguousarray(blocks[str(b)]["coeffs"][()], dtype=dtype),
+                   np.asarray(blocks[str(b)]["outputs"][()], dtype=np.int64)) for b in range(len(blocks))]
+    else:
+        coeffs = np.ascontiguousarray(group["coeffs"][()], dtype=dtype)
     if "coeffs_full" in group:
         full = np.ascontiguousarray(group["coeffs_full"][()], dtype=dtype)
     elif bool(group.attrs["full_is_coeffs"]):
         full = coeffs
     else:
         full = None
+    truncation = None
+    if "rel_tol" in group.attrs:
+        truncation = {
+            "rel_tol": float(group.attrs["rel_tol"]),
+            "norm": str(group.attrs["norm"]),
+            "per_output": bool(group.attrs["per_output"]),
+            "max_blocks": int(group.attrs["max_blocks"]) if "max_blocks" in group.attrs else None,
+            "groups": (tuple(str(g) for g in _python_value(group.attrs["groups"]))
+                       if "groups" in group.attrs else None),
+        }
     domains = group["domains"][()]
     output_names = [str(n) for n in group.attrs["output_names"]]
     return ChebyshevInterpolantND._from_tables(
@@ -366,7 +420,10 @@ def _read_table(group):
         abs_error=group["error_interpolation"][()],
         discarded=group["error_truncation"][()],
         scale=group["coeff_scale"][()],
+        discarded_l2=group["error_truncation_l2"][()] if "error_truncation_l2" in group else None,
+        truncation=truncation,
         grid_shape=[int(n) for n in group.attrs["grid_shape"]],
+        dtype=dtype,
     )
 
 
